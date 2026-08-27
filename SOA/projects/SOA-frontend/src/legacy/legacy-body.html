@@ -1,0 +1,194 @@
+    <div class="top-bar">
+        <!-- .top-bar is a two-end flex; the info button rides along with the title
+             inside .title-group rather than becoming a third child that floats. -->
+        <div class="title-group">
+            <h1>Algorand TX Sonifier</h1>
+            <button id="info-btn" class="info-btn" title="How it works &amp; what's new" aria-label="How it works and what's new">i</button>
+        </div>
+        <div class="controls">
+            <button id="start-btn">Start</button>
+            <button id="stop-btn">Stop</button>
+            <button id="record-btn" disabled>Record</button>
+            <button id="save-preset">Save Preset</button>
+            <button id="load-preset">Load Preset</button>
+            <button id="wallet-connect">Wallet</button>
+        </div>
+    </div>
+
+    <div class="actions-bar">
+        <select id="viz-select" class="viz-select" title="Full-screen pictures of the traffic you are hearing. Escape or a click returns.">
+            <option value="">Visualize</option>
+            <option value="score" title="The Score">Score</option>
+            <option value="loom" title="The Loom">Loom</option>
+            <option value="" disabled>Joy Division — later</option>
+            <option value="" disabled>Tetris — later</option>
+            <option value="" disabled>Drop — later</option>
+            <option value="kintsugi" title="Pending state fractures, certified state becomes gold">Kintsugi</option>
+            <option value="musicbox" title="Transactions pin the mempool drum and pluck the comb">Music Box</option>
+            <option value="territory" title="Every transaction claims its share of the screen; arrivals squeeze the standing ground aside">Territory</option>
+        </select>
+        <span id="stall-counter" title="Main-thread stalls over 50ms since load (temporary diagnostic)">stalls: 0</span>
+        <span id="load-readout" title="Audio-thread load: average / peak per interval, plus total render underruns (actual missed deadlines = audible glitches)">load: --</span>
+        <button id="toggle-aggr-btn" class="toggle-btn" disabled>Aggr Txs</button>
+        <input type="number" id="aggr-cap-input" min="1" max="100" value="10" title="Trigger cap: individual hits per synth per second before the overflow policy kicks in"><span class="aggr-cap-hint">1-100/s</span>
+        <span id="gossip-status" class="api-btn" title="Relay gossip connection">gossip: idle</span>
+        <button id="add-synth">+ Add Synth</button>
+        <span class="others-controls"><button id="toggle-others-btn" class="toggle-btn" title="Hear other people playing, each in the sound they designed">Others: on</button><input type="text" id="others-filter" placeholder="everyone" title="Hear only this player — an address or a name.algo. Blank hears everyone."></span>
+        <button id="add-midi" title="Play the mempool: notes go out as zero-amount transfers of an asset that does not exist">+ MIDI</button>
+    </div>
+
+    <div class="synth-grid" id="synth-container">
+        <!-- All Synths (including Master) will be dynamically added here -->
+    </div>
+
+    <div class="status-container">
+        <h3>Transaction Stream Status</h3>
+        <div id="status">Ready</div>
+        <div id="transaction-count">0 transactions processed</div>
+        <div id="type-counts-container">
+            <!-- Counts will be dynamically populated here by JS -->
+        </div>
+        <div id="persistent-tx-count" class="persistent-count">Lifetime Txs: 0</div>
+        <div id="persistent-block-count" class="persistent-count">Lifetime Blocks: 0</div>
+    </div>
+
+    <footer class="site-footer">
+        <div class="footer-credits">
+            <!-- Filled from __APP_VERSION__ at boot so it can never drift from package.json -->
+            <span id="footer-version"></span>
+            <span>Mempool gossip provided by <a href="https://nodely.io" target="_blank" rel="noopener noreferrer">Nodely</a>.</span>
+            <span>Made with &lt;3 by <a href="https://x.com/hampelman_data" target="_blank" rel="noopener noreferrer">Hampelman</a>.</span>
+        </div>
+        <div class="footer-links">
+            <a href="https://discord.gg/H4YBcYRsNe" target="_blank" rel="noopener noreferrer" title="Discord" aria-label="Discord">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 0 0-4.8851-1.5152.0741.0741 0 0 0-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 0 0-.0785-.037 19.7363 19.7363 0 0 0-4.8852 1.515.0699.0699 0 0 0-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 0 0 .0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 0 0 .0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 0 0-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 0 1-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 0 1 .0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 0 1 .0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 0 1-.0066.1276 12.2986 12.2986 0 0 1-1.873.8914.0766.0766 0 0 0-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 0 0 .0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 0 0 .0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 0 0-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>
+            </a>
+            <a href="https://github.com/knonode/The-Sound-of-AVM" target="_blank" rel="noopener noreferrer" title="GitHub" aria-label="GitHub">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
+            </a>
+        </div>
+    </footer>
+
+    <!-- Visualizations: fullscreen overlay, closed by default. Opened via
+         the Visualize menu in the actions-bar; click or Escape to close. -->
+    <div class="viz-container" id="viz-score" style="display: none;">
+        <canvas id="xenakis-canvas" class="viz-canvas"></canvas>
+    </div>
+    <div class="viz-container" id="viz-loom" style="display: none;">
+        <canvas id="loom-canvas" class="viz-canvas"></canvas>
+    </div>
+    <div class="viz-container" id="viz-kintsugi" style="display: none;">
+        <canvas id="kintsugi-canvas" class="viz-canvas"></canvas>
+    </div>
+    <div class="viz-container" id="viz-musicbox" style="display: none;">
+        <canvas id="musicbox-canvas" class="viz-canvas"></canvas>
+    </div>
+    <div class="viz-container" id="viz-territory" style="display: none;">
+        <div id="territory-root"></div>
+    </div>
+
+    <!-- Shown once per version: what the app is, plus what changed in this release.
+         A centred card like the preset modals; filled by maybeShowVersionBanner(). -->
+    <div id="version-banner" class="legacy-modal version-modal">
+        <div class="modal-content">
+            <span class="modal-close" id="version-banner-dismiss">&times;</span>
+            <div class="banner-text" id="version-banner-text"></div>
+            <div class="modal-buttons">
+                <button class="banner-link" id="version-banner-link">How it works</button>
+                <button class="banner-link" id="version-banner-changelog">Full changelog</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Info modal: how-to guide + changelog. Panes are built on first open
+         (see buildInfoPanes) so the guide screenshots cost nothing on page load. -->
+    <div id="info-modal" class="legacy-modal info-modal">
+        <div class="modal-content">
+            <span class="modal-close" id="info-modal-close">&times;</span>
+            <h2>The Sound of AVM <span id="info-version" class="info-version"></span></h2>
+            <div class="info-tabs">
+                <button class="info-tab-btn active" data-info-tab="howto">How it works</button>
+                <button class="info-tab-btn" data-info-tab="changelog">What's new</button>
+            </div>
+            <div class="info-pane" data-info-pane="howto"></div>
+            <div class="info-pane" data-info-pane="changelog" style="display: none;"></div>
+        </div>
+    </div>
+
+    <!-- Modal for Loading Presets -->
+    <div id="load-preset-modal" class="legacy-modal">
+        <div class="modal-content">
+            <span class="modal-close" id="load-modal-close">&times;</span>
+
+            <!-- User's Preset NFTs Section -->
+            <h3> Your NFPresets</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="font-size: 14px; color: #666;">Wallet presets</span>
+                <button id="refresh-nft-presets-btn" style="font-size: 12px; color: #006666; background: none; border: none; cursor: pointer; text-decoration: underline;">Refresh</button>
+            </div>
+            <div id="user-nft-presets-container" style="max-height: 200px; overflow-y: auto; margin-bottom: 16px;">
+                <div style="text-align: center; padding: 20px; color: #666; font-size: 14px;">
+                    <p>No NFPresets found in your wallet</p>
+                    <p style="font-size: 12px; margin-top: 4px;">Mint some NFPresets first to see them here</p>
+                </div>
+            </div>
+
+            <hr>
+
+            <!-- Legacy Preset Buttons Section -->
+            <h3>Local & Server Presets</h3>
+            <div id="modal-preset-buttons" class="modal-buttons">
+                <!-- Preset buttons will be dynamically added here by the script -->
+            </div>
+
+            <hr>
+
+            <h3>Or Upload File</h3>
+            <input type="file" id="preset-file-input" accept=".json">
+
+            <!-- Error Display -->
+            <div id="load-error-display" style="display: none; background: #fef2f2; border: 1px solid #fecaca; border-radius: 4px; padding: 8px; margin-top: 12px;">
+                <p id="load-error-text" style="color: #dc2626; font-size: 12px; margin: 0;"></p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for Saving Presets -->
+    <div id="save-preset-modal" class="legacy-modal">
+        <div class="modal-content">
+            <span class="modal-close" id="save-modal-close">&times;</span>
+            <h2>Save Preset</h2>
+            <div id="current-preset-label">current: unsaved layout</div>
+            <input type="text" id="new-preset-name" placeholder="Name (for Save As...)">
+            <div class="modal-options">
+                <input type="checkbox" id="download-json-toggle" style="vertical-align: middle;">
+                <label for="download-json-toggle">Also download as .json file</label>
+            </div>
+            <div class="modal-buttons">
+                <button id="save-overwrite-btn" disabled>Save</button>
+                <button id="save-as-btn">Save As...</button>
+                <button id="save-copy-btn">Save a Copy</button>
+            </div>
+
+            <hr style="margin: 12px 0; opacity: 0.4;" />
+
+            <h3>Or Mint NFPreset on-chain</h3>
+            <input type="text" id="nfpreset-nft-name" placeholder="NFP Name (max 32)" maxlength="32" style="width: 100%; margin-bottom: 6px;" />
+            <input type="text" id="nfpreset-unit-name" placeholder="Unit Name (max 8)" maxlength="8" style="width: 100%; margin-bottom: 6px;" />
+            <input type="number" id="nfpreset-supply" placeholder="Supply (default 1)" min="1" max="1000" style="width: 100%; margin-bottom: 6px;" />
+            <input type="text" id="nfpreset-ipfs-token" placeholder="Pinata JWT Token (for IPFS metadata)" style="width: 100%; margin-bottom: 6px;" autocomplete="off" data-form-type="other" />
+            <div style="font-size: 11px; color: #666; margin-bottom: 6px; line-height: 1.3;">
+              Get your free Pinata JWT token at <a href="https://app.pinata.cloud/developers/api-keys" target="_blank" style="color: #006666;">app.pinata.cloud/developers/api-keys</a>
+            </div>
+            <div style="margin-bottom: 12px;">
+              <label for="nfpreset-image-input" style="display: block; font-size: 12px; color: #666; margin-bottom: 4px;">NFT Image (optional - will use placeholder if not selected)</label>
+              <input type="file" id="nfpreset-image-input" accept="image/*" style="width: 100%; font-size: 12px;" />
+            </div>
+            <div class="modal-buttons">
+                <button id="mint-nfpreset-btn">Mint NFPreset</button>
+            </div>
+        </div>
+    </div>
+
+    <datalist id="asa-datalist"></datalist>
+

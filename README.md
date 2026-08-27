@@ -1,45 +1,71 @@
 # The Sound of AVM
 
-## Algorand Transaction Sonifier
+A live sonifier for the Algorand mempool. It connects directly to a relay's
+gossip WebSocket, decodes signed transactions as they arrive, and plays them
+through per-type synths built with [Tone.js](https://tonejs.github.io/).
 
-In this prototype stage, use Algoranding API or connect to your node through a port with an `algod` token that can be found in your node directory. The token is stored in local browser storage. Before using your local node from the deployed app, you must enable CORS headers. Add this to your Algorand node config.json: `"EnablePrivateNetworkAccessHeader": true`. Then restart your Algorand node.
+## Run it locally
 
-Alternatively, fork the repo and start a local server, for example:
+From `SOA/projects/SOA-frontend/`:
 
 ```bash
-npx http-server .
+npm install
+cp .env.template .env       # algod/indexer config, for wallet + NFPreset features
+npm run dev                 # :5173
 ```
 
-The script polls the pending transactions every 50ms and lets `Tone.js` schedule them to be played.
+There is no backend to run. The gossip feed is a public relay endpoint, so the
+sonifier works as soon as the page loads — press **Start**.
 
----
+## What it does
 
-**How to Play**
+- **Live data, not polling** — subscribes to relay gossip, no backend of its own.
+- **One synth per transaction type**, filterable down to specific assets,
+  apps, accounts, or amount ranges — you design the identity, not the app.
+- **Several synth engines** — Synth, MonoSynth, PolySynth, AM and FM — over a
+  shared effects chain: filter, delay, a shared convolution reverb bus, vibrato,
+  and an LFO with several destinations.
+- **Visualizations** — Score, Territory and others render the same traffic
+  you're hearing, full-screen, while it plays.
+- **An instrument you can play** — plug in a MIDI device and each note becomes
+  a real transaction, heard when it comes back out of the mempool. The instrument
+  is a keyless escrow, so several people can play the same one at once, each in
+  the sound they designed. See `SOA/projects/SOA-frontend/tools/midi/`.
+- **Presets** — save and load whole layouts, locally, as a `.json`, or minted
+  on-chain as an NFPreset. Loading a shipped preset or an NFPreset puts it in
+  the address bar, so copying the URL is all it takes to share it.
 
-Start with a default preset from the Load Preset menu and play around with the settings. Less is more. Add synths and set the sources as your favorite accounts, ASAs and applications. Create more exciting soundscape by assigning more than one synth to one source but with different sounds. Less is more. Let the `block` synth be the rythm and create a theme, like arbitrage, ora mining, stable coins, memecoins. Save your preset layout, download the json, share with friends.
+There's a how-to guide inside the app, behind the **(i)** beside the title.
 
-**UI Elements:**
+## Versioning
 
-*   **Top bar buttons:** 
-    *   Play/Stop, Record (under construction).
-    *   Save/Load preset - saving in local storage and as a .json file to share with friends. 
-    *   Aggr/Single Txs (under construction).
-    *   Nodely API/Your Node - choose your victim. +Add Synth - add synth.
-    
-* **MASTER BUS:** simple master controls. If Mute all, it's possible to unmute single synths.
-*   **Synth:** Every single synth can be set up with main tx types and/or their subtypes, except stateproof and heartbeat (for now). If only main type is chosen, it will play all txs of that type. If you have one `axfer` synth and one `axfer-assetId`, the latter will only play transfer txs of that asset, while the main `axfer` synth will **exclude** the txs with that asset from it's schedule.
-*   **Effects:** The synth has a panel of effects, and they are modulating the signal sequentially, ending with an LFO, which adds a flair of modularity.
+SemVer, single-sourced from `SOA/projects/SOA-frontend/package.json` and injected
+at build time. To release: bump the version, add a matching entry to
+`src/legacy/changelog.js`, commit, then
 
----
+```bash
+git tag -a vX.Y.Z -m "..."
+git push origin main --follow-tags   # this also deploys
+```
 
-**Future improvements and considerations**
+Two things worth knowing before choosing a number:
 
-1.  Transactions come in too fast for `Tone.js`, making it unable to create unique timestamps for every one of them.
-    *   Adjust `setTimeout`.
-    *   **Aggregation:** Add a chorus/phaser/flanger effect, count transactions in each polling batch, apply an aggregation function instead of individual sounds, let the user control via UI. We have a toggle now for this, but functionality not yet implemented. Considering adding functionality for single synths instead of global.
-    *   Ignore missed transactions (current behavior).
-2.  `gpu` and Rasterize paint are heavy users in the performance record.
-3.  Excessive console logging; consider adding a debugging flag and wrapping log statements.
-4. Add logic to detect and filter certified blocks, which will enable granular control of `appl` and inner txs and `hb` tx senders and others that are not accessible in the mempool.
-5. Introduce menus where user can pick from a list of popular assets and known applications to initialize those parameters immediately. Consider adding logos as well.
-6. Record .wav files and mint them on-chain.
+**The compatibility surface is presets, not code.** Nobody imports this as a
+library, so "breaking" means a preset that used to sound right no longer does.
+Renaming or repurposing a settings key is MAJOR; adding one with a sensible
+default is MINOR. Presets carry `formatVersion` (the shape of the file) and
+`appVersion` (what wrote it) so old ones can be routed to old behaviour rather
+than silently re-voiced — which matters because **NFPresets are immutable
+on-chain** and cannot be re-stamped or migrated after the fact.
+
+**A bump interrupts everyone.** The version drives a card that every returning
+user sees once. Docs and tooling changes ride along with the next real release
+rather than earning one of their own.
+
+Pre-1.0 while the preset schema is still settling. Reaching 1.0 is a statement
+that presets are stable, not that the feature list is finished.
+
+## Stack
+
+AlgoKit workspace · React + Vite frontend · Tone.js audio engine · a thin
+gossip-protocol client in `src/services/gossip/`.

@@ -1,0 +1,4537 @@
+// Global error handler for debugging
+window.addEventListener('error', (event) => {
+    console.error('🚨 Global JavaScript Error:', event.error);
+    console.error('🚨 Error message:', event.message);
+    console.error('🚨 Error filename:', event.filename);
+    console.error('🚨 Error line:', event.lineno);
+});
+
+// Unhandled promise rejection handler
+window.addEventListener('unhandledrejection', (event) => {
+    console.error('🚨 Unhandled Promise Rejection:', event.reason);
+});
+
+import * as Tone from 'tone';
+import GossipAPI from '../services/gossip';
+import { APP_VERSION } from './app-version.js';
+import { CHANGELOG } from './changelog.js';
+import { GUIDE_SECTIONS } from './guide-sections.js';
+import { initCardReorder } from './card-reorder.js';
+import { initXenakisViz, vizAddTx, vizAddBlock } from './xenakis-viz.js';
+import { initLoomViz, loomAddTx, loomAddBlock } from './loom-viz.js';
+import { initKintsugiViz, kintsugiAddTx, kintsugiAddBlock } from './kintsugi-viz.js';
+import { initMusicBoxViz, musicBoxAddTx, musicBoxAddBlock } from './music-box-viz.js';
+import { initTerritoryViz, territoryAddTx, territoryAddBlock } from './territory-viz.js';
+import {
+    initAudio,
+    initializeToneForInstance,
+    disposeSynth,
+    playTransactionSound,
+    connectLFO,
+    toggleMasterMute,
+    muteSynthVolume,
+    unmuteSynthVolume,
+    updateMasterVolume,
+    updateMasterEQ,
+    updateMasterCompressor,
+    updateMasterLimiter,
+    getMasterMeterValues,
+    scaleLfoDepth,
+    rewireFxChain,
+    updateSharedReverbRoomSize,
+    rebuildVoice,
+    applyVoice,
+    synthsInitialized,
+    isMasterMuted,
+    masterVolumeBeforeMute,
+    unlockIOSAudioOnce
+} from './tone-synthesis.js';
+
+import {
+    decodeNote,
+    sendNote,
+    claimRoundTrip,
+    listMidiInputs,
+    bindMidiCard,
+    unbindMidiCard,
+    PARTS,
+    onMidiPortChange,
+    midiSupported,
+    isValidPlayer,
+    looksLikeNfd,
+    resolveNfd,
+    isPatchAsset,
+    isNoteAsset,
+    getMidiStats,
+    getKeyboardAddress,
+    getKeyboardBalance,
+} from './midi-keyboard.js';
+
+import { ellipseAddress } from '../utils/ellipseAddress';
+import { packVoice, unpackVoice, voiceFingerprint } from '../services/midi/voice';
+
+// UI and application state (non-synthesis)
+let isPlaying = false;
+let transactionCount = 0;
+let txTypeCounts = {};
+let persistentTotalTxs = 0;
+let persistentTotalBlocks = 0;
+
+// localStorage writes are synchronous disk I/O — at mempool rate they add
+// up, so the lifetime counters flush on a slow timer instead of per tx.
+let persistentCountersDirty = false;
+function flushPersistentCounters() {
+    if (!persistentCountersDirty) return;
+    persistentCountersDirty = false;
+    localStorage.setItem('persistentTotalTxs', persistentTotalTxs.toString());
+    localStorage.setItem('persistentTotalBlocks', persistentTotalBlocks.toString());
+}
+setInterval(flushPersistentCounters, 5000);
+window.addEventListener('pagehide', flushPersistentCounters);
+let lastProcessedRound = null;
+
+let activeSynths = [];
+
+// Define the chromatic scale for cycling
+const chromaticScale = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const defaultOctave = 4;
+
+// --- ASA name search: one shared datalist fed by the Deflex asset list ---
+let asaListLoaded = false;
+async function ensureAsaDatalist() {
+    if (asaListLoaded) return;
+    asaListLoaded = true; // only try once per session
+    try {
+        const res = await fetch('https://deflex.txnlab.dev/api/fetchAssets', {
+            headers: { 'Content-Type': 'application/json' }
+        });
+        if (!res.ok) throw new Error(`${res.status}`);
+        const assets = await res.json();
+        const datalist = document.getElementById('asa-datalist');
+        if (!datalist || !Array.isArray(assets)) return;
+        datalist.innerHTML = assets
+            .slice(0, 1000)
+            .map(a => `<option value="${a.id}">${(a.name || '?').replace(/</g, '')} (${(a.unit_name || '').replace(/</g, '')})</option>`)
+            .join('');
+        console.log(`ASA datalist loaded: ${Math.min(assets.length, 1000)} assets`);
+    } catch (err) {
+        console.warn('Could not load ASA list for name search:', err);
+        asaListLoaded = false; // allow a retry on next render
+    }
+}
+
+// Old presets stored a separate Pitch offset (same axis as Base Note).
+// Fold it into baseNote once so removed-slider presets sound identical.
+function foldPitchIntoBaseNote(settings) {
+    const pitch = settings?.pitch ?? 0;
+    if (!pitch) return settings;
+    try {
+        const match = String(settings.baseNote).match(/^([A-G]#?)([0-9])$/);
+        if (match) {
+            const idx = chromaticScale.indexOf(match[1]) + parseInt(match[2], 10) * 12 + pitch;
+            const clamped = Math.max(0, Math.min(107, idx));
+            settings.baseNote = `${chromaticScale[clamped % 12]}${Math.floor(clamped / 12)}`;
+        }
+    } catch (err) {
+        console.warn('Could not fold pitch into base note:', err);
+    }
+    settings.pitch = 0;
+    return settings;
+}
+
+// --- LED ladder meters (read-only diagnosis + eye candy) ---
+const METER_SEGS = 12;
+function meterLadderHTML(id) {
+    let segs = '';
+    for (let i = 0; i < METER_SEGS; i++) {
+        const cls = i >= 11 ? 'seg top' : i >= 9 ? 'seg warn' : 'seg';
+        segs += `<div class="${cls}"></div>`;
+    }
+    return `<div class="level-meter" id="${id}">${segs}</div>`;
+}
+
+const meterClipHold = {};
+function updateLadder(id, db) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const v = typeof db === 'number' && isFinite(db) ? db : -100;
+    const lit = Math.max(0, Math.min(METER_SEGS, Math.round(((v + 48) / 48) * METER_SEGS)));
+    const now = performance.now();
+    if (v > -1) meterClipHold[id] = now + 600; // hold the red for visibility
+    const clipping = (meterClipHold[id] || 0) > now;
+    const kids = el.children;
+    for (let i = 0; i < METER_SEGS; i++) {
+        kids[i].classList.toggle('lit', i < lit);
+        if (i === METER_SEGS - 1) kids[i].classList.toggle('clip', clipping);
+    }
+}
+
+function startMeterLoop() {
+    let frame = 0;
+    const tick = () => {
+        requestAnimationFrame(tick);
+        if (document.hidden || (++frame & 1)) return; // ~30fps is plenty
+        for (const inst of activeSynths) {
+            const m = inst.toneObjects?.meter;
+            if (m) updateLadder(`${inst.id}-meter`, m.getValue());
+        }
+        const [l, r] = getMasterMeterValues();
+        updateLadder('master-meter-l', l);
+        updateLadder('master-meter-r', r);
+    };
+    requestAnimationFrame(tick);
+}
+
+// Temporary diagnostic: audible-glitch counter, faster and more honest
+// than the DevTools capacity display. Uses the renderCapacity API where
+// available (load% + real underrun counts); otherwise a worklet sentinel
+// measures audio-clock vs wall-clock drift — every upward jump is rendered
+// time the output never received, i.e. an audible gap.
+function startLoadReadout() {
+    const el = document.getElementById('load-readout');
+    if (!el) return;
+    // Tone's rawContext is a standardized-audio-context wrapper; reach the
+    // real browser AudioContext underneath (same render thread, same graph).
+    const raw = Tone.getContext().rawContext;
+    const native = raw._nativeAudioContext ?? raw;
+
+    const cap = native.renderCapacity;
+    if (cap && typeof cap.start === 'function') {
+        let glitches = 0;
+        const quantaPerInterval = (0.25 * (native.sampleRate || 48000)) / 128;
+        cap.addEventListener('update', (e) => {
+            glitches += Math.round((e.underrunRatio ?? 0) * quantaPerInterval);
+            el.textContent = `load: ${Math.round(e.averageLoad * 100)}% pk ${Math.round(e.peakLoad * 100)}% glitches: ${glitches}`;
+            el.classList.toggle('bad', (e.underrunRatio ?? 0) > 0 || e.peakLoad > 0.95);
+        });
+        try { cap.start({ updateInterval: 0.25 }); return; } catch { /* fall through */ }
+    }
+
+    if (!native.audioWorklet) { el.textContent = 'glitches: n/a'; return; }
+    const src = `registerProcessor('glitch-sentinel', class extends AudioWorkletProcessor {
+        constructor() { super(); this.w0 = 0; this.lastPost = 0; this.min = Infinity; this.max = -Infinity; }
+        process() {
+            if (!this.w0) { this.w0 = Date.now(); this.a0 = currentTime; }
+            const drift = (Date.now() - this.w0) / 1000 - (currentTime - this.a0);
+            if (drift < this.min) this.min = drift;
+            if (drift > this.max) this.max = drift;
+            if (currentTime - this.lastPost >= 0.25) {
+                this.lastPost = currentTime;
+                this.port.postMessage([this.min, this.max]);
+                this.min = Infinity;
+                this.max = -Infinity;
+            }
+            return true;
+        }
+    });`;
+    const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    native.audioWorklet.addModule(url).then(() => {
+        const node = new AudioWorkletNode(native, 'glitch-sentinel',
+            { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+        node.connect(native.destination); // silent; only exists so it gets rendered
+        // Even a healthy renderer works in bursts, so the drift signal
+        // oscillates by the output buffer size at all times. Learn that
+        // normal amplitude first; only excursions beyond it are actual
+        // gaps. >0.5s means the context was suspended — relearn instead.
+        let normalAmp = null;
+        let learned = 0;
+        let count = 0;
+        let totalMs = 0;
+        let wasIdle = true;
+        node.port.onmessage = (ev) => {
+            // Chromium idles the physical output stream when the context is
+            // silent, making render cadence irregular by design — only what
+            // happens while the stream plays is worth counting, and each
+            // start relearns the live cadence.
+            if (!isPlaying) { wasIdle = true; return; }
+            if (wasIdle) { wasIdle = false; normalAmp = null; learned = 0; }
+            const [min, max] = ev.data;
+            if (!Number.isFinite(min) || !Number.isFinite(max)) return;
+            const amp = max - min;
+            if (amp > 0.5) { normalAmp = null; learned = 0; return; }
+            if (learned < 8) {
+                normalAmp = normalAmp === null ? amp : Math.max(normalAmp, amp);
+                learned++;
+            } else if (amp > normalAmp * 1.5 + 0.010) {
+                count++;
+                totalMs += Math.round((amp - normalAmp) * 1000);
+            } else {
+                normalAmp = normalAmp * 0.98 + amp * 0.02; // track slow drift on clean intervals
+            }
+            el.textContent = `glitches: ${count}${totalMs ? ` (${totalMs}ms)` : ''}`;
+            el.classList.toggle('bad', count > 0);
+        };
+        el.textContent = 'glitches: 0';
+    }).catch(() => { el.textContent = 'glitches: n/a'; });
+}
+
+// Temporary diagnostic: count main-thread stalls (>50ms long tasks).
+// Late note scheduling from stalls = scratches and dropouts.
+function startStallCounter() {
+    const el = document.getElementById('stall-counter');
+    if (!el || typeof PerformanceObserver === 'undefined') return;
+    let count = 0;
+    let worst = 0;
+    try {
+        const obs = new PerformanceObserver((list) => {
+            for (const entry of list.getEntries()) {
+                count++;
+                worst = Math.max(worst, Math.round(entry.duration));
+            }
+            el.textContent = `stalls: ${count} (worst ${worst}ms)`;
+            el.classList.toggle('bad', worst > 150);
+        });
+        obs.observe({ entryTypes: ['longtask'] });
+    } catch (err) {
+        el.textContent = 'stalls: n/a';
+    }
+}
+
+// --- Pan / filter display helpers ---
+function formatPan(pan) {
+    const pct = Math.round(pan * 100);
+    if (pct === 0) return 'C';
+    return pct < 0 ? `${-pct}L` : `${pct}R`;
+}
+// Log-scale cutoff slider: 0-100 -> 50 Hz .. 20 kHz
+function sliderToCutoff(v) {
+    return Math.round(50 * Math.pow(400, v / 100));
+}
+function cutoffToSlider(hz) {
+    return Math.round(100 * Math.log(hz / 50) / Math.log(400));
+}
+function formatCutoff(hz) {
+    return hz >= 1000 ? `${(hz / 1000).toFixed(1)} kHz` : `${Math.round(hz)} Hz`;
+}
+
+// Log-scale time sliders: position 0-100 <-> seconds in [min, max].
+// The useful short range keeps most of the slider travel; the long tail
+// (drones, swells) lives in the last stretch.
+const TIME_RANGES = {
+    attack:   [0.001, 10],
+    decay:    [0.001, 10],
+    release:  [0.005, 10],
+    duration: [0.01, 20],
+    lfoRate:  [0.01, 30],
+};
+function sliderToTime(pos, [min, max]) {
+    return min * Math.pow(max / min, pos / 100);
+}
+function timeToSlider(t, [min, max]) {
+    const clamped = Math.max(min, Math.min(max, t));
+    return Math.round(100 * Math.log(clamped / min) / Math.log(max / min));
+}
+function formatSecs(t) {
+    return t >= 10 ? `${t.toFixed(1)}s` : t >= 1 ? `${t.toFixed(2)}s` : `${t.toFixed(3)}s`;
+}
+
+function getDefaultInstanceSettings() {
+    return {
+        engine: 'polysynth', // 'synth' | 'monosynth' | 'polysynth' | 'am' | 'fm'
+        oscillator: { type: 'sine' },
+        envelope: { attack: 0.01, decay: 0.2, sustain: 0.3, release: 0.2 },
+        detune: 0,
+        harmonicity: 3, // am, fm
+        modulationIndex: 10, // fm only
+        filterEnvelope: { attack: 0.6, decay: 0.2, sustain: 0.5, release: 2 }, // monosynth only
+        volume: -8,
+        pan: 0,
+        muted: false,
+        savedVolume: null,
+        mutedByMaster: false,
+        pitch: 0,
+        filter: { cutoff: 20000 },
+        delay: { time: 0, feedback: 0, wet: 0 },
+        reverb: { roomSize: 0.5, wet: 0.3 },
+        lfo: {
+            rate: 5, // Hz
+            depth: 0, // 0-100 scale, initially off
+            waveform: 'sine',
+            destination: 'none' // 'none', 'pitch', 'volume', 'delayTime'
+        },
+        noteDuration: 0.1,
+        baseNote: `A${defaultOctave}`,
+        sequence: [0, 0, 0, 0, 0, 0, 0, 0],
+        currentStepIndex: 0
+    };
+}
+
+const granularityRules = {
+  pay: [
+    { subtype: 'amount', field: 'amt', params: ['min', 'max'], description: 'Amount range' },
+    { subtype: 'sender', field: 'snd', params: ['address'], description: 'Sender address' },
+    { subtype: 'receiver', field: 'rcv', params: ['address'], description: 'Receiver address' }
+  ],
+  axfer: [
+    { subtype: 'assetid', field: 'xaid', params: ['asset-id'], description: 'Asset ID' },
+    { subtype: 'amount', field: 'aamt', params: ['min', 'max'], description: 'Asset amount range' },
+    { subtype: 'sender', field: 'asnd', params: ['address'], description: 'Asset sender' },
+    { subtype: 'receiver', field: 'arcv', params: ['address'], description: 'Asset receiver' },
+    { subtype: 'opt-in', field: 'xaid', params: ['asset-id'], description: 'Asset Opt-in ID' },
+    { subtype: 'opt-out', field: 'aclose', params: ['address'], description: 'Asset Opt-out Close To' },
+    { subtype: 'clawback', field: 'asnd', params: ['address'], description: 'Clawback Target Addr' }
+  ],
+  appl: [
+     { subtype: 'appid', field: 'apid', params: ['app-id'], description: 'Application ID'},
+     { subtype: 'foreign-asset', field: 'apas', params: ['asset-id'], description: 'Includes Asset ID' },
+     { subtype: 'foreign-account', field: 'apat', params: ['address'], description: 'Includes Account' }
+  ],
+  acfg: [
+    { subtype: 'create', field: 'caid', params: ['manager-address'], description: 'Asset Create (Manager Addr)' },
+    { subtype: 'reconfigure', field: 'caid', params: ['asset-id'], description: 'Asset Reconfigure ID' },
+    { subtype: 'destroy', field: 'caid', params: ['asset-id'], description: 'Asset Destroy ID' }
+  ],
+  keyreg: [
+      { subtype: 'online', field: 'votekey', params: ['toggle'], description: 'Online Registration' },
+      { subtype: 'offline', field: 'nonpart', params: ['toggle'], description: 'Offline Registration' }
+  ],
+  afrz: [
+      { subtype: 'freeze', field: 'afrz', params: [], description: 'Freeze Asset (true)' },
+      { subtype: 'unfreeze', field: 'afrz', params: [], description: 'Unfreeze Asset (false)' }
+  ],
+  stpf: [
+      { subtype: 'stpf', field: null, params: [], description: 'State Proof Transaction' }
+  ],
+  hb: [
+      { subtype: 'heartbeat', field: null, params: [], description: 'Heartbeat' },
+      { subtype: 'account', field: 'hbad', params: ['address'], description: 'Heartbeat target account' }
+  ],
+  group: [
+    { subtype: 'asset', field: 'assets', params: ['asset-id'], description: 'Group touches ASA (e.g. a DEX swap of it)' },
+    { subtype: 'app', field: 'apids', params: ['app-id'], description: 'Group calls App ID' },
+    { subtype: 'size', field: 'size', params: ['min', 'max'], description: 'Group size range' }
+  ],
+  block: [
+    // Remove the subtypes - leave empty array or just one simple option
+  ]
+};
+// Get main types for easy access
+const mainTxTypes = Object.keys(granularityRules);
+
+
+function initializeTypeCounts() {
+    txTypeCounts = {}; // Reset
+    mainTxTypes.forEach(type => {
+        txTypeCounts[type] = 0;
+    });
+    updateTypeCountsDisplay();
+}
+
+function updateTypeCountsDisplay() {
+    const container = document.getElementById('type-counts-container');
+    if (!container) {
+        // console.warn("Type counts container not found in UI.");
+        return;
+    }
+
+    // Build HTML string based on mainTxTypes order and current counts,
+    // followed by any types the stream produced that aren't in the rules
+    const allTypes = [...new Set([...mainTxTypes, ...Object.keys(txTypeCounts)])];
+    let htmlContent = allTypes.map(type => {
+        const count = txTypeCounts[type] || 0; // Get count, default to 0
+        // Only display if count > 0 or always display? Let's display always for consistency.
+        return `<span class="type-count" id="count-${type}">${type}: ${count}</span>`;
+    }).join(' '); // Add space between counts
+
+    container.innerHTML = htmlContent || 'No transactions yet.'; // Show message if empty
+}
+
+// Hot path: update the one changed counter's text in place — a full
+// innerHTML rebuild per transaction churns DOM nodes at mempool rate.
+function bumpTypeCountDisplay(type) {
+    const el = document.getElementById(`count-${type}`);
+    if (el) el.textContent = `${type}: ${txTypeCounts[type] || 0}`;
+    else updateTypeCountsDisplay(); // first sighting of this type: build its span
+}
+
+// SVG Icons for Mute/Unmute (Monochrome)
+const svgIconUnmuted = `<svg viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" style="display: block; margin: auto;">
+  <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+</svg>`;
+
+const svgIconMuted = `<svg viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" style="display: block; margin: auto;">
+  <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+</svg>`;
+
+const ENGINE_LABELS = {
+    synth: { label: 'Synth', title: 'Synth: oscillator + amp envelope, single voice (retriggers cut off)' },
+    monosynth: { label: 'Mono', title: 'MonoSynth: single voice with its own filter + filter envelope' },
+    polysynth: { label: 'Poly', title: 'PolySynth: layered voices (default)' },
+    am: { label: 'AM', title: 'AM: amplitude-modulated layered voices' },
+    fm: { label: 'FM', title: 'FM: frequency-modulated layered voices' }
+};
+
+function renderEngineSection(uniqueId, settings) {
+    const engine = settings.engine ?? 'polysynth';
+    const buttons = Object.entries(ENGINE_LABELS).map(([key, { label, title }]) => `
+        <button class="engine-btn ${engine === key ? 'active' : ''}" data-engine="${key}" data-instance-id="${uniqueId}" title="${title}">${label}</button>
+    `).join('');
+    return `
+        <div class="engine-section">
+            <div class="control-row engine-row">${buttons}</div>
+        </div>
+    `;
+}
+
+// Tab 1 (ADSR) is universal. Tab 2 holds whatever the chosen engine adds on
+// top — Detune always (every Tone instrument has it), Harmonicity for
+// AM/FM, Modulation Index for FM only. MonoSynth gets a third tab for its
+// own filter envelope (brightness over time, independent from loudness).
+// Only one tab's content is visible at a time, so this never grows past
+// the two new rows (engine picker + tab strip) the card already budgets.
+function renderAdsrSection(uniqueId, settings, activeTabIn) {
+    const engine = settings.engine ?? 'polysynth';
+    const hasFilterEnv = engine === 'monosynth';
+    const activeTab = activeTabIn || 'adsr';
+    const tab2Label = engine === 'am' ? 'AM' : engine === 'fm' ? 'FM' : 'Detune';
+
+    const adsrRows = `
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Attack: seconds to reach full level (0.001-10)">A</span>
+            <input type="range" id="${uniqueId}-attack" min="0" max="100" step="1" value="${timeToSlider(settings.envelope.attack, TIME_RANGES.attack)}" data-instance-id="${uniqueId}" data-param="attack">
+            <input class="value-input adsr-num" id="${uniqueId}-attack-value" value="${formatSecs(settings.envelope.attack)}" data-instance-id="${uniqueId}" data-vctrl="attack" title="Attack in seconds — type a value">
+        </div>
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Decay: seconds from peak down to sustain level (0.001-10)">D</span>
+            <input type="range" id="${uniqueId}-decay" min="0" max="100" step="1" value="${timeToSlider(settings.envelope.decay, TIME_RANGES.decay)}" data-instance-id="${uniqueId}" data-param="decay">
+            <input class="value-input adsr-num" id="${uniqueId}-decay-value" value="${formatSecs(settings.envelope.decay)}" data-instance-id="${uniqueId}" data-vctrl="decay" title="Decay in seconds — type a value">
+        </div>
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Sustain: held level while the note lasts (0-1)">S</span>
+            <input type="range" id="${uniqueId}-sustain" min="0" max="1" step="0.01" value="${settings.envelope.sustain}" data-instance-id="${uniqueId}" data-param="sustain">
+            <input class="value-input adsr-num" id="${uniqueId}-sustain-value" value="${settings.envelope.sustain.toFixed(2)}" data-instance-id="${uniqueId}" data-vctrl="sustain" title="Sustain level 0-1 — type a value">
+        </div>
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Release: seconds to fade after the note ends (0.005-10)">R</span>
+            <input type="range" id="${uniqueId}-release" min="0" max="100" step="1" value="${timeToSlider(settings.envelope.release, TIME_RANGES.release)}" data-instance-id="${uniqueId}" data-param="release">
+            <input class="value-input adsr-num" id="${uniqueId}-release-value" value="${formatSecs(settings.envelope.release)}" data-instance-id="${uniqueId}" data-vctrl="release" title="Release in seconds — type a value">
+        </div>
+    `;
+
+    // Detune is the only control on this tab for synth/monosynth/polysynth
+    // — the tab title "Detune" already says what it is, so the row label
+    // is dropped there (its explanation moves to the slider's tooltip).
+    // AM/FM share the tab with other params, so the label stays to tell
+    // the rows apart.
+    const soloDetune = !(engine === 'am' || engine === 'fm');
+    const detuneTitle = 'Detune in cents (+/-1200 = +/-1 octave) — fine tuning beneath the semitone grid, not a replacement for base note/sequence';
+    const extrasRows = `
+        <div class="control-row adsr-row">
+            ${soloDetune ? '' : `<span class="control-label adsr-label" title="${detuneTitle}">Det.</span>`}
+            <input type="range" id="${uniqueId}-detune" min="-1200" max="1200" step="1" value="${settings.detune ?? 0}" data-instance-id="${uniqueId}" title="${soloDetune ? detuneTitle : ''}">
+            <input class="value-input adsr-num" id="${uniqueId}-detune-value" value="${(settings.detune ?? 0).toFixed(0)}" data-instance-id="${uniqueId}" data-vctrl="detune" title="Detune in cents — type a value">
+        </div>
+        ${(engine === 'am' || engine === 'fm') ? `
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Harmonicity: ratio between carrier and modulator (1 = unison, 2 = an octave up)">Harm.</span>
+            <input type="range" id="${uniqueId}-harmonicity" min="0.1" max="8" step="0.1" value="${settings.harmonicity ?? 3}" data-instance-id="${uniqueId}">
+            <input class="value-input adsr-num" id="${uniqueId}-harmonicity-value" value="${(settings.harmonicity ?? 3).toFixed(1)}" data-instance-id="${uniqueId}" data-vctrl="harmonicity" title="Harmonicity ratio — type a value">
+        </div>` : ''}
+        ${engine === 'fm' ? `
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Modulation index: how strongly the modulator bends the carrier — low is gentle, high gets harsh/metallic">Mod.</span>
+            <input type="range" id="${uniqueId}-modindex" min="0" max="100" step="1" value="${settings.modulationIndex ?? 10}" data-instance-id="${uniqueId}">
+            <input class="value-input adsr-num" id="${uniqueId}-modindex-value" value="${(settings.modulationIndex ?? 10).toFixed(0)}" data-instance-id="${uniqueId}" data-vctrl="modindex" title="Modulation index — type a value">
+        </div>` : ''}
+    `;
+
+    const fenv = settings.filterEnvelope || {};
+    const filterEnvRows = hasFilterEnv ? `
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Filter envelope attack: seconds to reach full brightness (0.001-10)">A</span>
+            <input type="range" id="${uniqueId}-fenv-attack" min="0" max="100" step="1" value="${timeToSlider(fenv.attack ?? 0.6, TIME_RANGES.attack)}" data-instance-id="${uniqueId}">
+            <input class="value-input adsr-num" id="${uniqueId}-fenv-attack-value" value="${formatSecs(fenv.attack ?? 0.6)}" data-instance-id="${uniqueId}" data-vctrl="fenv-attack" title="Filter envelope attack in seconds — type a value">
+        </div>
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Filter envelope decay: seconds falling to the sustain brightness (0.001-10)">D</span>
+            <input type="range" id="${uniqueId}-fenv-decay" min="0" max="100" step="1" value="${timeToSlider(fenv.decay ?? 0.2, TIME_RANGES.decay)}" data-instance-id="${uniqueId}">
+            <input class="value-input adsr-num" id="${uniqueId}-fenv-decay-value" value="${formatSecs(fenv.decay ?? 0.2)}" data-instance-id="${uniqueId}" data-vctrl="fenv-decay" title="Filter envelope decay in seconds — type a value">
+        </div>
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Filter envelope sustain: held brightness while the note lasts (0-1)">S</span>
+            <input type="range" id="${uniqueId}-fenv-sustain" min="0" max="1" step="0.01" value="${fenv.sustain ?? 0.5}" data-instance-id="${uniqueId}">
+            <input class="value-input adsr-num" id="${uniqueId}-fenv-sustain-value" value="${(fenv.sustain ?? 0.5).toFixed(2)}" data-instance-id="${uniqueId}" data-vctrl="fenv-sustain" title="Filter envelope sustain 0-1 — type a value">
+        </div>
+        <div class="control-row adsr-row">
+            <span class="control-label adsr-label" title="Filter envelope release: seconds fading back to dark after the note ends (0.005-10)">R</span>
+            <input type="range" id="${uniqueId}-fenv-release" min="0" max="100" step="1" value="${timeToSlider(fenv.release ?? 2, TIME_RANGES.release)}" data-instance-id="${uniqueId}">
+            <input class="value-input adsr-num" id="${uniqueId}-fenv-release-value" value="${formatSecs(fenv.release ?? 2)}" data-instance-id="${uniqueId}" data-vctrl="fenv-release" title="Filter envelope release in seconds — type a value">
+        </div>
+    ` : '';
+
+    return `
+        <div class="adsr-section">
+            <div class="control-row tab-strip">
+                <button class="tab-btn ${activeTab === 'adsr' ? 'active' : ''}" data-tab="adsr" data-instance-id="${uniqueId}">ADSR</button>
+                <button class="tab-btn ${activeTab === 'extras' ? 'active' : ''}" data-tab="extras" data-instance-id="${uniqueId}">${tab2Label}</button>
+                ${hasFilterEnv ? `<button class="tab-btn ${activeTab === 'filterenv' ? 'active' : ''}" data-tab="filterenv" data-instance-id="${uniqueId}">Filter Env</button>` : ''}
+            </div>
+            <div class="synth-tab-content" data-tab-content="adsr" style="${activeTab === 'adsr' ? '' : 'display:none'}">${adsrRows}</div>
+            <div class="synth-tab-content" data-tab-content="extras" style="${activeTab === 'extras' ? '' : 'display:none'}">${extrasRows}</div>
+            ${hasFilterEnv ? `<div class="synth-tab-content" data-tab-content="filterenv" style="${activeTab === 'filterenv' ? '' : 'display:none'}">${filterEnvRows}</div>` : ''}
+        </div>
+    `;
+}
+
+const createSynthHTML = (synthInstance) => {
+    const settings = { ...getDefaultInstanceSettings(), ...(synthInstance.settings || {}) };
+    const config = synthInstance.config || { type: null, subtype: null, parameters: {} };
+    const uniqueId = synthInstance.id;
+    const typeClass = config.type ? `synth-${config.type}` : '';
+    const currentVolume = settings.volume;
+
+    // --- Generate sequence inputs HTML ---
+    let sequenceInputsHTML = '';
+    for (let i = 0; i < 8; i++) {
+        const seqValue = settings.sequence?.[i] ?? 0;
+        sequenceInputsHTML += `<div class="seq-step">
+                                 <input type="number" id="${uniqueId}-seq-${i}" class="seq-input" value="${seqValue}" min="-24" max="24" step="1" title="Step ${i + 1}: Semitone offset" data-instance-id="${uniqueId}" data-seq-index="${i}">
+                                 <div class="seq-indicator" id="${uniqueId}-seq-indicator-${i}"></div>
+                               </div>`;
+    }
+
+    // --- Generate Header HTML ---
+    // A MIDI card isn't a filter over the feed the way the others are — it
+    // listens for one shape of transaction only — so it gets a name where the
+    // Type and Sub selects would be, rather than two menus with one option.
+    const headerHTML = config.type === 'midi' ? `
+        <div class="synth-header">
+            <div class="led" id="led-${uniqueId}" title="click to test this sound"></div>
+            <select id="${uniqueId}-midi-device" class="midi-device-select" data-instance-id="${uniqueId}" title="Which MIDI device this card plays from">
+                <option value="">MIDI</option>
+            </select>
+            <select id="${uniqueId}-midi-channel" class="midi-channel-select" data-instance-id="${uniqueId}" title="Which MIDI channel this card plays. One card per channel turns a multi-track device into separate parts, each with its own sound.">
+                ${midiChannelOptions(config.parameters?.channel ?? 0)}
+            </select>
+            <button class="mute-btn" data-instance-id="${uniqueId}" title="Mute/Unmute Synth">${settings.muted ? svgIconMuted : svgIconUnmuted}</button>
+            <button class="close-btn" data-instance-id="${uniqueId}" title="Remove Synth">×</button>
+        </div>
+    ` : `
+        <div class="synth-header">
+            <div class="led" id="led-${uniqueId}" title="click to test this sound"></div>
+            <select class="type-select" data-instance-id="${uniqueId}" title="Select Transaction Type">
+                <option value="">Type</option>
+                ${mainTxTypes.map(t => `<option value="${t}" ${config.type === t ? 'selected' : ''}>${t}</option>`).join('')}
+            </select>
+            <select class="subtype-select" data-instance-id="${uniqueId}" title="Select Subtype (after Type)">
+                <option value="">Sub</option>
+                ${config.type && granularityRules[config.type] ?
+                    granularityRules[config.type].map(rule => `<option value="${rule.subtype}" ${config.subtype === rule.subtype ? 'selected' : ''}>${rule.subtype}</option>`).join('') : ''
+                }
+            </select>
+            <button class="mute-btn" data-instance-id="${uniqueId}" title="Mute/Unmute Synth">${settings.muted ? svgIconMuted : svgIconUnmuted}</button>
+            <button class="close-btn" data-instance-id="${uniqueId}" title="Remove Synth">×</button>
+        </div>
+    `;
+
+    // --- Generate Parameter Area HTML ---
+    const parameterAreaHTML = `<div class="parameter-area" id="params-${uniqueId}"></div>`;
+
+    // --- Generate Tone.js Controls HTML ---
+    const controlsHTML = `
+        ${renderEngineSection(uniqueId, settings)}
+
+        <!-- Volume Section -->
+        <div class="volume-section">
+            <div class="control-row">
+                <span class="control-label">Volume: <input class="value-input" id="${uniqueId}-volume-value" value="${currentVolume.toFixed(1)} dB" data-instance-id="${uniqueId}" data-vctrl="volume" title="Volume in dB — type a value"></span>
+            </div>
+            <div class="control-row">
+                <input type="range" id="${uniqueId}-volume" min="-24" max="3" step="0.5" value="${currentVolume}" data-instance-id="${uniqueId}">
+            </div>
+            <div class="control-row">
+                <span class="control-label">Pan: <input class="value-input" id="${uniqueId}-pan-value" value="${formatPan(settings.pan ?? 0)}" data-instance-id="${uniqueId}" data-vctrl="pan" title="Pan: -100 (L) to 100 (R), or e.g. 25L / 25R / C"></span>
+            </div>
+            <div class="control-row">
+                <input type="range" id="${uniqueId}-pan" min="-100" max="100" step="1" value="${Math.round((settings.pan ?? 0) * 100)}" data-instance-id="${uniqueId}">
+            </div>
+        </div>
+
+        <!-- Base Note Section -->
+        <div class="base-note-section">
+            <span class="control-label">Base Note</span>
+            <div class="control-row base-note-controls">
+                <button class="octave-down" data-instance-id="${uniqueId}" title="Octave Down">Oct-</button>
+                <button class="base-note-down" data-instance-id="${uniqueId}" title="Note Down">←</button>
+                <span class="base-note-display" id="${uniqueId}-base-note-display">${settings.baseNote}</span>
+                <button class="base-note-up" data-instance-id="${uniqueId}" title="Note Up">→</button>
+                <button class="octave-up" data-instance-id="${uniqueId}" title="Octave Up">Oct+</button>
+            </div>
+        </div>
+
+        <!-- Step Sequencer Section -->
+        <div class="sequencer-section">
+            <span class="control-label" style="cursor:help" title="Semitone Offset">Sequencer</span>
+            <div class="control-row sequencer-steps">
+                ${sequenceInputsHTML}
+            </div>
+        </div>
+
+        <!-- Gate Time Section -->
+        <div class="gate-section">
+            <div class="control-row">
+                <span class="control-label">Gate Time: <input class="value-input" id="${uniqueId}-note-duration-value" value="${formatSecs(settings.noteDuration)}" data-instance-id="${uniqueId}" data-vctrl="duration" title="Note duration in seconds (0.01-20) — type a value"></span>
+            </div>
+            <div class="control-row">
+                <input type="range" id="${uniqueId}-note-duration" min="0" max="100" step="1" value="${timeToSlider(settings.noteDuration, TIME_RANGES.duration)}" data-instance-id="${uniqueId}">
+            </div>
+        </div>
+
+        ${renderAdsrSection(uniqueId, settings, synthInstance._activeTab)}
+
+        <!-- Waveform Section -->
+        <div class="waveform-section">
+            <div class="control-row">
+                <span class="control-label inline-label">Waveform</span>
+                <select id="${uniqueId}-waveform" class="waveform-select compact-select" data-instance-id="${uniqueId}">
+                    <option value="sine" ${settings.oscillator.type === 'sine' ? 'selected' : ''}>Sine</option>
+                    <option value="square" ${settings.oscillator.type === 'square' ? 'selected' : ''}>Square</option>
+                    <option value="triangle" ${settings.oscillator.type === 'triangle' ? 'selected' : ''}>Triangle</option>
+                    <option value="sawtooth" ${settings.oscillator.type === 'sawtooth' ? 'selected' : ''}>Sawtooth</option>
+                    <option value="fatsine" ${settings.oscillator.type === 'fatsine' ? 'selected' : ''}>Fat Sine</option>
+                    <option value="fatsquare" ${settings.oscillator.type === 'fatsquare' ? 'selected' : ''}>Fat Square</option>
+                    <option value="fattriangle" ${settings.oscillator.type === 'fattriangle' ? 'selected' : ''}>Fat Triangle</option>
+                    <option value="fatsawtooth" ${settings.oscillator.type === 'fatsawtooth' ? 'selected' : ''}>Fat Sawtooth</option>
+                </select>
+            </div>
+            <div class="control-row">
+                <span class="control-label">Cutoff: <input class="value-input" id="${uniqueId}-filter-cutoff-value" value="${formatCutoff(settings.filter?.cutoff ?? 20000)}" data-instance-id="${uniqueId}" data-vctrl="cutoff" title="Cutoff in Hz (accepts e.g. 1200 or 1.2k) — type a value"></span>
+            </div>
+            <div class="control-row">
+                <input type="range" id="${uniqueId}-filter-cutoff" min="0" max="100" step="1" value="${cutoffToSlider(settings.filter?.cutoff ?? 20000)}" data-instance-id="${uniqueId}">
+            </div>
+        </div>
+
+        <!-- Delay Section (was Effect Controls) -->
+        <div class="delay-section">
+            <div class="control-row"> <span class="control-label">Delay Time: <input class="value-input" id="${uniqueId}-delay-time-value" value="${settings.delay.time.toFixed(2)}s" data-instance-id="${uniqueId}" data-vctrl="delay-time" title="Delay time in seconds (0-4) — type a value"></span> </div>
+            <div class="control-row"> <input type="range" id="${uniqueId}-delay-time" min="0" max="4" step="0.01" value="${settings.delay.time}" data-instance-id="${uniqueId}"> </div>
+            <div class="control-row"> <span class="control-label">Feedback: <input class="value-input" id="${uniqueId}-delay-feedback-value" value="${settings.delay.feedback.toFixed(2)}" data-instance-id="${uniqueId}" data-vctrl="delay-feedback" title="Feedback 0-0.95 — type a value"></span> </div>
+            <div class="control-row"> <input type="range" id="${uniqueId}-delay-feedback" min="0" max="0.95" step="0.01" value="${settings.delay.feedback}" data-instance-id="${uniqueId}"> </div>
+            <div class="control-row"> <span class="control-label">Delay Wet: <input class="value-input" id="${uniqueId}-delay-wet-value" value="${settings.delay.wet.toFixed(2)}" data-instance-id="${uniqueId}" data-vctrl="delay-wet" title="Delay wet 0-1 (0 = effect disconnected) — type a value"></span> </div>
+            <div class="control-row"> <input type="range" id="${uniqueId}-delay-wet" min="0" max="1" step="0.01" value="${settings.delay.wet}" data-instance-id="${uniqueId}"> </div>
+        </div>
+
+        <!-- Reverb Section -->
+        <div class="reverb-section">
+            <div class="control-row"> <span class="control-label">Room Size: <input class="value-input" id="${uniqueId}-reverb-size-value" value="${(settings.reverb.roomSize ?? Math.max(0.05, Math.min(0.95, ((settings.reverb.decay ?? 1.5) / 10)))).toFixed(2)}" data-instance-id="${uniqueId}" data-vctrl="reverb-size" title="Room size 0-1 (global: one shared hall) — type a value"></span> </div>
+            <div class="control-row"> <input type="range" id="${uniqueId}-reverb-size" min="0" max="1" step="0.01" value="${(settings.reverb.roomSize ?? Math.max(0.05, Math.min(0.95, ((settings.reverb.decay ?? 1.5) / 10))))}" data-instance-id="${uniqueId}"> </div>
+            <div class="control-row"> <span class="control-label">Reverb Wet: <input class="value-input" id="${uniqueId}-reverb-wet-value" value="${settings.reverb.wet.toFixed(2)}" data-instance-id="${uniqueId}" data-vctrl="reverb-wet" title="Reverb send 0-1 (0 = disconnected) — type a value"></span> </div>
+            <div class="control-row"> <input type="range" id="${uniqueId}-reverb-wet" min="0" max="1" step="0.01" value="${settings.reverb.wet}" data-instance-id="${uniqueId}"> </div>
+        </div>
+
+        <!-- LFO Section -->
+        <div class="lfo-section">
+            <span class="control-label">LFO</span>
+            <div class="control-row"> <span class="control-label">Rate: <input class="value-input" id="${uniqueId}-lfo-rate-value" value="${settings.lfo.rate >= 1 ? settings.lfo.rate.toFixed(1) : settings.lfo.rate.toFixed(2)} Hz" data-instance-id="${uniqueId}" data-vctrl="lfo-rate" title="LFO rate in Hz (0.01-30) — type a value"></span> </div>
+            <div class="control-row"> <input type="range" id="${uniqueId}-lfo-rate" min="0" max="100" step="1" value="${timeToSlider(settings.lfo.rate, TIME_RANGES.lfoRate)}" data-instance-id="${uniqueId}"> </div>
+            <div class="control-row"> <span class="control-label">Depth: <input class="value-input" id="${uniqueId}-lfo-depth-value" value="${settings.lfo.depth.toFixed(0)}" data-instance-id="${uniqueId}" data-vctrl="lfo-depth" title="LFO depth 0-100 — type a value"></span> </div>
+            <div class="control-row"> <input type="range" id="${uniqueId}-lfo-depth" min="0" max="100" step="1" value="${settings.lfo.depth}" data-instance-id="${uniqueId}"> </div>
+
+            <div class="control-row">
+                <span class="control-label inline-label">Waveform</span>
+                <select id="${uniqueId}-lfo-waveform" class="lfo-waveform-select compact-select" data-instance-id="${uniqueId}">
+                    <option value="sine" ${settings.lfo.waveform === 'sine' ? 'selected' : ''}>Sine</option>
+                    <option value="square" ${settings.lfo.waveform === 'square' ? 'selected' : ''}>Square</option>
+                    <option value="triangle" ${settings.lfo.waveform === 'triangle' ? 'selected' : ''}>Triangle</option>
+                    <option value="sawtooth" ${settings.lfo.waveform === 'sawtooth' ? 'selected' : ''}>Sawtooth</option>
+                </select>
+            </div>
+
+            <div class="control-row">
+                <span class="control-label inline-label">Dest.</span>
+                <select id="${uniqueId}-lfo-destination" class="lfo-destination-select compact-select" data-instance-id="${uniqueId}">
+                    <option value="none" ${settings.lfo.destination === 'none' ? 'selected' : ''}>None</option>
+                    <option value="pitch" ${settings.lfo.destination === 'pitch' ? 'selected' : ''}>Vibrato</option>
+                    <option value="volume" ${settings.lfo.destination === 'volume' ? 'selected' : ''}>Volume</option>
+                    <option value="cutoff" ${settings.lfo.destination === 'cutoff' ? 'selected' : ''}>Cutoff</option>
+                    <option value="delayTime" ${settings.lfo.destination === 'delayTime' ? 'selected' : ''}>Delay Time</option>
+                </select>
+            </div>
+        </div>
+    `;
+
+    // Combine parts
+    const htmlString = `
+        <div class="mini-synth ${typeClass}" data-instance-id="${uniqueId}">
+            ${meterLadderHTML(`${uniqueId}-meter`)}
+            ${headerHTML}
+            <!-- Not aria-hidden any more: it is a control now. Its role, its
+                 name and its position in the order are written by
+                 card-reorder.js, which is the only thing that knows them. -->
+            <div class="grab-strip"></div>
+            ${parameterAreaHTML}
+            ${controlsHTML}
+        </div>
+    `;
+    return htmlString;
+};
+
+// <<< NEW: Function to generate the HTML for the Master Synth controller >>>
+const createMasterSynthHTML = () => {
+    const uniqueId = 'master'; // A fixed ID for the master controls
+
+    const headerHTML = `
+        <div class="synth-header">
+            <select class="type-select" disabled><option>MASTER</option></select>
+            <select class="subtype-select" disabled><option>FX</option></select>
+            <button class="mute-btn" data-instance-id="${uniqueId}" title="Mute/Unmute All">${svgIconUnmuted}</button>
+            <button class="close-btn" data-instance-id="${uniqueId}" title="Master cannot be removed" disabled>×</button>
+        </div>
+    `;
+
+    const parameterAreaHTML = `<div class="parameter-area" id="params-${uniqueId}"></div>`;
+
+    const controlsHTML = `
+        <!-- Master Volume Section -->
+        <div class="volume-section">
+            <div class="control-row">
+                <span class="control-label">Master Volume: <span id="${uniqueId}-volume-value">-3.0 dB</span></span>
+            </div>
+            <div class="control-row">
+                <input type="range" id="${uniqueId}-volume" min="-24" max="3" step="0.5" value="-3.0" data-instance-id="${uniqueId}">
+            </div>
+        </div>
+
+        <!-- Compressor Section -->
+        <div class="compressor-section">
+            <span class="control-label">Compressor</span>
+            <div class="control-row"><span class="control-label">Threshold: <span id="${uniqueId}-comp-thresh-val">-24 dB</span></span></div>
+            <div class="control-row"><input type="range" id="${uniqueId}-comp-thresh" min="-60" max="0" value="-24" data-instance-id="${uniqueId}"></div>
+            <div class="control-row"><span class="control-label">Ratio: <span id="${uniqueId}-comp-ratio-val">4:1</span></span></div>
+            <div class="control-row"><input type="range" id="${uniqueId}-comp-ratio" min="1" max="20" value="4" data-instance-id="${uniqueId}"></div>
+        </div>
+
+        <!-- 3-Band EQ Section -->
+        <div class="eq-section">
+            <span class="control-label">3-Band EQ</span>
+            <div class="control-row"><span class="control-label">Low: <span id="${uniqueId}-eq-low-val">0 dB</span></span></div>
+            <div class="control-row"><input type="range" id="${uniqueId}-eq-low" min="-12" max="12" value="0" data-instance-id="${uniqueId}"></div>
+            <div class="control-row"><span class="control-label">Mid: <span id="${uniqueId}-eq-mid-val">0 dB</span></span></div>
+            <div class="control-row"><input type="range" id="${uniqueId}-eq-mid" min="-12" max="12" value="0" data-instance-id="${uniqueId}"></div>
+            <div class="control-row"><span class="control-label">High: <span id="${uniqueId}-eq-high-val">0 dB</span></span></div>
+            <div class="control-row"><input type="range" id="${uniqueId}-eq-high" min="-12" max="12" value="0" data-instance-id="${uniqueId}"></div>
+        </div>
+
+        <!-- Limiter Section -->
+        <div class="limiter-section">
+            <span class="control-label">Limiter</span>
+            <div class="control-row"><span class="control-label">Threshold: <span id="${uniqueId}-limit-thresh-val">-2.0 dB</span></span></div>
+            <div class="control-row"><input type="range" id="${uniqueId}-limit-thresh" min="-6" max="-2" step="0.1" value="-2" data-instance-id="${uniqueId}"></div>
+        </div>
+    `;
+
+    const fullHTML = `
+        <div class="mini-synth master-synth" data-instance-id="${uniqueId}">
+            <div class="master-meter">${meterLadderHTML('master-meter-l')}${meterLadderHTML('master-meter-r')}</div>
+            ${headerHTML}
+            ${parameterAreaHTML}
+            ${controlsHTML}
+        </div>
+    `;
+    return fullHTML;
+};
+
+// initAudio function moved to tone-synthesis.js
+
+// initializeToneForInstance function moved to tone-synthesis.js
+
+// disposeSynth function moved to tone-synthesis.js
+// UI-specific cleanup (state proof countdown) is handled separately
+
+// <<< SIMPLE STATE PROOF TIMER (v2) >>>
+let currentRound = 0; // maintained by block handler elsewhere
+
+// Honest tracker: the header's spt[0].n is the round the next state proof
+// covers. We count down to that boundary; past it, the network is gathering
+// signatures for a variable number of rounds ("sigs…") until the proof tx
+// lands and the header jumps to the next cycle.
+let nextStateProofRound = 0; // authoritative spt.n from the block header
+
+function updateStpfDisplays() {
+    let text = '…';
+    if (nextStateProofRound > 0 && currentRound > 0) {
+        const remaining = nextStateProofRound - currentRound;
+        text = remaining > 0 ? remaining.toString() : 'sigs…';
+    }
+    activeSynths.filter(s => s.config.type === 'stpf').forEach(s => {
+        const el = document.getElementById(`${s.id}-stpf-countdown`);
+        if (el) el.textContent = text;
+    });
+}
+
+function onNewBlock(blockRound, sptNFromHeader) {
+    currentRound = blockRound;
+    if (typeof sptNFromHeader === 'number' && sptNFromHeader > 0) {
+        nextStateProofRound = sptNFromHeader;
+    }
+    updateStpfDisplays();
+}
+
+function onStpfTransaction() {
+    // Proof observed in the mempool: flash the displays until the header
+    // confirms the next cycle.
+    activeSynths.filter(s => s.config.type === 'stpf').forEach(s => {
+        const el = document.getElementById(`${s.id}-stpf-countdown`);
+        if (el) el.textContent = '✓ proof';
+    });
+}
+
+// <<< State proof overlay: the whole tx JSON, flowing bottom to top,
+//     too fast to read, transparent, overwhelming. >>>
+let stpfOverlayActive = false;
+function showStateProofOverlay(rawTx) {
+    if (stpfOverlayActive) return; // one proof at a time
+    try {
+        const json = JSON.stringify(rawTx, null, 2);
+        if (!json) return;
+        stpfOverlayActive = true;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'stpf-overlay';
+        overlay.title = 'click to dismiss';
+        const pre = document.createElement('pre');
+        pre.textContent = json;
+        overlay.appendChild(pre);
+        document.body.appendChild(overlay);
+
+        requestAnimationFrame(() => {
+            // Whole body sweeps past in a fixed time regardless of size —
+            // a state proof is megabytes of JSON, so this is very fast.
+            const SWEEP_MS = 15000;
+            const distance = pre.scrollHeight + window.innerHeight;
+            const anim = pre.animate(
+                [
+                    { transform: 'translateY(100vh)' },
+                    { transform: `translateY(-${distance - window.innerHeight}px)` }
+                ],
+                { duration: SWEEP_MS, easing: 'linear' }
+            );
+            const cleanup = () => { overlay.remove(); stpfOverlayActive = false; };
+            anim.onfinish = cleanup;
+            anim.oncancel = cleanup;
+            // Immersion escape hatch: a click ends the sweep early
+            overlay.addEventListener('click', () => anim.cancel(), { once: true });
+        });
+    } catch (err) {
+        console.warn('State proof overlay failed:', err);
+        stpfOverlayActive = false;
+    }
+}
+// Expose for manual testing from the console
+window.showStateProofOverlay = showStateProofOverlay;
+
+// --- Compatibility shims for legacy calls elsewhere in code ---
+function initializeStateProofCountdown() {/* deprecated in v2 */}
+function stopStateProofCountdown() {/* deprecated in v2 */}
+
+
+// Function to update current round displays for block synths
+function updateCurrentRoundDisplays() {
+    activeSynths.forEach(instance => {
+        if (instance.config.type === 'block') {
+            const roundElement = document.getElementById(`${instance.id}-current-round`);
+            if (roundElement) {
+                const displayRound = currentRound > 0 ? currentRound : 'N/A';
+                roundElement.textContent = `${displayRound}`;
+            }
+        }
+    });
+}
+
+// <<< NEW: Function to update state proof countdowns when rounds change >>>
+function updateStateProofCountdowns() {/* deprecated in v2 */}
+
+// <<< UPDATED: Transaction stream to reset countdown on stpf tx >>>
+const startTransactionStream = async () => {
+    // Try to initialize audio first (this will work after user clicks)
+    if (!synthsInitialized) {
+        console.log("Audio not initialized, attempting init...");
+        await initAudio();
+        if (!synthsInitialized) {
+            alert('Audio could not be initialized. Please try clicking the button again.');
+            return;
+        }
+    }
+
+    // Ensure all active synths have Tone objects initialized
+    for (const instance of activeSynths) {
+        if (!instance.toneObjects) {
+            console.log(`Initializing Tone for instance ${instance.id} before starting stream...`);
+            await initializeToneForInstance(instance);
+        }
+    }
+
+    // Reset counters
+    transactionCount = 0;
+    initializeTypeCounts();
+    lastProcessedRound = null;
+    // Reset sequence indices for all instances
+    activeSynths.forEach(inst => inst.settings.currentStepIndex = 0);
+
+    // <<< NEW: Initialize state proof countdowns for all stpf synths at play start >>>
+    const stpfSynths = activeSynths.filter(instance => instance.config.type === 'stpf');
+    for (const instance of stpfSynths) {
+        await initializeStateProofCountdown(instance.id);
+        console.log(`Initialized state proof countdown for ${instance.id}`);
+    }
+
+    isPlaying = true;
+    updateStatus('Connecting to relay gossip...');
+
+    const connected = await GossipAPI.start((txType, txData) => {
+      if (!isPlaying) return;
+
+    // --- Core Matching Logic ---
+    const mainType = txType.split('-')[0]; // Get base type (e.g., 'pay', 'axfer')
+
+    // <<< CORRECTED: Handle stpf transactions >>>
+    if (mainType === 'stpf') {
+        console.log(`📝 Stpf transaction detected in round ${txData.round || currentRound}`);
+
+        // Notify state-proof timer and rain the full proof down the screen
+        onStpfTransaction();
+        showStateProofOverlay(txData.raw ?? txData);
+    }
+
+    // --- Update current round and state proof data ---
+    if (txType === 'block' && txData.round) {
+        // Feed state-proof timer with authoritative block data
+        onNewBlock(txData.round, txData.nextStateProofRound);
+        if (currentRound === 0) {
+            currentRound = txData.round;
+            console.log(`🔥 Initial currentRound set to: ${currentRound}`);
+
+            // <<< NEW: Initialize countdowns immediately when we get the first round >>>
+            const stpfSynths = activeSynths.filter(instance => instance.config.type === 'stpf');
+            for (const instance of stpfSynths) {
+                initializeStateProofCountdown(instance.id);
+            }
+        }
+        // Always update the current round for subsequent blocks
+        if (txData.round > currentRound) {
+            console.log(`🔥 Updating currentRound from ${currentRound} to ${txData.round}`);
+            currentRound = txData.round;
+
+
+
+            // State proof tracking is handled by onNewBlock above.
+        }
+    }
+
+    // Round displays only change when a block certifies — refreshing (and
+    // allocating a timer) per transaction was pure churn. The small delay
+    // lets the DOM settle, as before.
+    if (mainType === 'block') setTimeout(updateCurrentRoundDisplays, 10);
+
+    // --- Update All Counters ---
+
+    // 1. Session-based counters ('group' shows in type counts but is not a tx)
+    if (mainType !== 'group') transactionCount++;
+    if (txTypeCounts.hasOwnProperty(mainType)) {
+        txTypeCounts[mainType]++;
+      } else {
+        txTypeCounts[mainType] = 1; // Count even if no synth is configured
+      }
+
+    // 2. Persistent counters ('group' is synthetic - members are already counted)
+    if (mainType === 'block') {
+        persistentTotalBlocks++;
+        persistentCountersDirty = true;
+    } else if (mainType !== 'group') {
+        persistentTotalTxs++;
+        persistentCountersDirty = true;
+    }
+
+    // --- Feed the visualizations (hidden ones sleep; feeding is cheap) ---
+    if (mainType === 'block') {
+        vizAddBlock(txData.round);
+        loomAddBlock(txData.round);
+        kintsugiAddBlock(txData.round);
+        musicBoxAddBlock(txData.round);
+        territoryAddBlock(txData.round);
+    } else {
+        vizAddTx(mainType, txData);
+        loomAddTx(mainType, txData);
+        kintsugiAddTx(mainType, txData);
+        musicBoxAddTx(mainType, txData);
+        territoryAddTx(mainType, txData);
+    }
+
+    // --- Update All UI Displays ---
+    const totalCountEl = document.getElementById('transaction-count');
+    if (totalCountEl) totalCountEl.textContent = `${transactionCount} transactions processed`;
+    bumpTypeCountDisplay(mainType);
+    updatePersistentCountersDisplay();
+
+    // --- MIDI notes ---
+    // A note is an axfer like any other, and an axfer synth hears it as one:
+    // hiding it would be a lie about what is in the mempool. What a MIDI card
+    // adds is the pitch — the same transaction, sounded at the note its asset
+    // ID encodes rather than at one note for the whole type.
+    if (mainType === 'axfer') {
+        const xaid = txData?.txn?.xaid;
+        if (isNoteAsset(xaid)) spendFromEscrow();
+        if (isPatchAsset(xaid)) {
+            receiveCarriedVoice(txData);
+        } else {
+            const carried = decodeNote(xaid);
+            if (carried) {
+                // A note's own field usually holds eight random bytes, but it
+                // is where a player's sound rides. Read it before the note
+                // sounds, so the note it arrived with is already in the right
+                // voice.
+                receiveCarriedVoice(txData, carried.part);
+                routeMidiNote(carried, txData);
+            }
+        }
+    }
+
+    // --- NEW Prioritized Matching Logic ---
+    let potentialMatches = activeSynths.filter(instance => instance.config.type === mainType);
+
+    if (potentialMatches.length === 0) {
+        // No instances configured for this main type, do nothing for sound
+        return;
+    }
+
+    let specificMatches = [];
+    let generalMatches = [];
+
+    potentialMatches.forEach(instance => {
+        if (instance.config.subtype) {
+            // Check if specific subtype/params match
+            if (checkTransactionMatch(instance.config, txData)) {
+                specificMatches.push(instance);
+            }
+        } else {
+            // It's a general match (type matches, no subtype)
+            generalMatches.push(instance);
+        }
+    });
+
+    let instancesToPlay = [];
+    if (specificMatches.length > 0) {
+        // If any specific synth matches, only play those
+        instancesToPlay = specificMatches;
+
+    } else if (generalMatches.length > 0) {
+        // If no specific match, but general matches exist, play the general ones
+        instancesToPlay = generalMatches;
+    } else {
+        // No matches found for this type (specific check failed for all relevant subtypes)
+        // console.log(`TX ${txType} - No specific or general matches found.`);
+        // This case might occur if a type exists but all its specific subtypes fail the checkTransactionMatch
+    }
+
+    // Play sound for the selected instances (either specific or general)
+    if (instancesToPlay.length > 0) {
+        instancesToPlay.forEach((instance, matchIndex) => {
+            // Always play UI effects (LEDs, sequencer) regardless of mute state
+            // The mute check happens inside playTransactionSound to silence audio only
+            if (instance.toneObjects) {
+                 // Use matchIndex for slight time offset if multiple synths match same tx
+                triggerInstanceWithRateLimit(instance, matchIndex * 0.010);
+            }
+        });
+    }
+
+   }, updateGossipStatus);
+
+    if (!connected) {
+      console.error("Couldn't reach the gossip relay");
+      updateStatus('Failed to connect to the gossip relay');
+      isPlaying = false;
+      GossipAPI.stop();
+      alert('Could not connect to the Algorand gossip relay. Check your network and try again.');
+      return;
+    }
+
+    updateStatus('Connected - streaming live mempool');
+};
+
+// Reflect relay connection state in the actions bar
+function updateGossipStatus(state) {
+    const el = document.getElementById('gossip-status');
+    if (!el) return;
+    el.textContent = `gossip: ${state}`;
+    el.classList.toggle('active', state === 'open');
+}
+
+const stopTransactionStream = () => {
+    isPlaying = false;
+    GossipAPI.stop();
+    flushPersistentCounters();
+    updateGossipStatus('idle');
+    updateStatus('Stream stopped');
+
+    // Reset LEDs and indicators
+    document.querySelectorAll('.led.active').forEach(led => led.classList.remove('active'));
+    document.querySelectorAll('.seq-indicator.active').forEach(ind => ind.classList.remove('active'));
+};
+
+// <<< Helper function to check if a transaction matches instance config >>>
+function checkTransactionMatch(config, txData) {
+    const { type, subtype, parameters } = config;
+
+    // Handle block type specially - no subtype needed
+    if (type === 'block') {
+        return true; // Any block transaction triggers this
+    }
+
+    const rule = granularityRules[type]?.find(r => r.subtype === subtype);
+
+    if (!rule) return false;
+
+    // Ensure we have the transaction details, often nested under 'txn'
+    const txn = txData?.txn ?? txData; // Handle both potential structures
+
+    switch (`${type}-${subtype}`) {
+        case 'pay-amount':
+             // ... existing pay-amount logic using txn ...
+             const amt = txn?.amt ?? null;
+             if (amt === null) return false;
+             const userMin = parameters.min ?? null;
+             const userMax = parameters.max ?? null;
+             const minAmtMicroAlgos = userMin !== null ? userMin * 1000000 : -Infinity;
+             const maxAmtMicroAlgos = userMax !== null ? userMax * 1000000 : Infinity;
+             return amt >= minAmtMicroAlgos && amt <= maxAmtMicroAlgos;
+        case 'pay-sender':
+            // ... existing pay-sender logic using txn ...
+            const snd = txn?.snd ?? null;
+            return snd === parameters.address;
+        case 'pay-receiver':
+            // ... existing pay-receiver logic using txn ...
+            const rcv = txn?.rcv ?? null;
+            return rcv === parameters.address;
+
+        case 'axfer-assetid': // Matches any transfer of a specific asset
+            // ... existing axfer-assetid logic using txn ...
+            const xaid = txn?.xaid ?? null;
+            // Ensure parameter asset-id is treated as a number if present
+            const targetAssetId = parameters['asset-id'] !== undefined ? Number(parameters['asset-id']) : undefined;
+            return xaid !== null && (targetAssetId === undefined || xaid === targetAssetId);
+        case 'axfer-amount':
+            // ... existing axfer-amount logic using txn ...
+            const aamt = txn?.aamt ?? null;
+            if (aamt === null) return false;
+            const minAamt = parameters.min ?? -Infinity;
+            const maxAamt = parameters.max ?? Infinity;
+            return aamt >= minAamt && aamt <= maxAamt;
+        case 'axfer-sender':
+             // ... existing axfer-sender logic using txn ...
+             const asnd_axfer = txn?.asnd ?? null;
+             return asnd_axfer === parameters.address;
+        case 'axfer-receiver':
+             // ... existing axfer-receiver logic using txn ...
+             const arcv = txn?.arcv ?? null;
+             return arcv === parameters.address;
+        case 'axfer-opt-in':
+             // ... existing axfer-opt-in logic using txn ...
+             const isOptInAmt = (txn?.aamt ?? -1) === 0;
+             const isOptInTarget = (txn?.arcv) === (txn?.snd);
+             const optInAssetId = txn?.xaid ?? null;
+              // Ensure parameter asset-id is treated as a number if present
+             const optInTargetAssetId = parameters['asset-id'] !== undefined ? Number(parameters['asset-id']) : undefined;
+             return isOptInAmt && isOptInTarget && (optInTargetAssetId === undefined || optInAssetId === optInTargetAssetId);
+        case 'axfer-clawback':
+             // ... existing axfer-clawback logic using txn ...
+             const clawbackTarget = txn?.asnd ?? null;
+             console.warn("Clawback matching is complex and not fully implemented.");
+             return clawbackTarget === parameters.address;
+
+        case 'appl-appid':
+            // ... existing appl-appid logic using txn ...
+            const apid = txn?.apid ?? null;
+            // Ensure parameter app-id is treated as a number if present
+            const targetAppId = parameters['app-id'] !== undefined ? Number(parameters['app-id']) : undefined;
+            return apid !== null && targetAppId !== undefined && apid === targetAppId;
+
+        // <<< Logic for new appl subtypes >>>
+        case 'appl-foreign-asset':
+            const apas = txn?.apas ?? []; // foreign assets array
+            const searchAssetId = parameters['asset-id'] !== undefined ? Number(parameters['asset-id']) : undefined;
+            if (searchAssetId === undefined) {
+                return false;
+            }
+            return apas.includes(searchAssetId);
+
+        case 'appl-foreign-account':
+            const apat = txn?.apat ?? []; // accounts array
+            const searchAddress = parameters['address'];
+            if (!searchAddress) {
+                return false;
+            }
+            return apat.includes(searchAddress);
+
+        case 'keyreg-online':
+             // ... existing keyreg-online logic using txn ...
+             return txn?.votekey !== undefined && txn?.nonpart !== true;
+        case 'keyreg-offline':
+             // ... existing keyreg-offline logic using txn ...
+             return txn?.nonpart === true;
+
+        case 'afrz-freeze':
+             // ... existing afrz-freeze logic using txn ...
+             return (txn?.afrz) === true;
+        case 'afrz-unfreeze':
+             // ... existing afrz-unfreeze logic using txn ...
+              return (txn?.afrz) === false;
+
+        case 'axfer-opt-out': // Close-out of an asset position
+            return (txn?.aclose ?? null) !== null;
+
+        case 'acfg-create': // Asset creation has no caid
+            return (txn?.caid ?? null) === null;
+        case 'acfg-reconfigure': {
+            const caid = txn?.caid ?? null;
+            if (caid === null) return false;
+            const targetCfgId = parameters['asset-id'] !== undefined ? Number(parameters['asset-id']) : undefined;
+            return targetCfgId === undefined || caid === targetCfgId;
+        }
+        case 'acfg-destroy': {
+            // Destroy = caid present with no new params; from the mempool we
+            // can't always see apar, so match on caid like reconfigure.
+            const caid = txn?.caid ?? null;
+            if (caid === null) return false;
+            const targetDestroyId = parameters['asset-id'] !== undefined ? Number(parameters['asset-id']) : undefined;
+            return targetDestroyId === undefined || caid === targetDestroyId;
+        }
+
+        case 'hb-heartbeat': // Matches any heartbeat tx
+            return true;
+        case 'hb-account': // Heartbeat aimed at a specific account
+            return (txn?.hbad ?? null) === parameters.address;
+
+        // <<< Atomic groups, emitted once per group by the gossip module >>>
+        case 'group-asset': {
+            const groupAssets = txn?.assets ?? [];
+            const wantedAsset = parameters['asset-id'] !== undefined ? Number(parameters['asset-id']) : undefined;
+            return wantedAsset !== undefined && groupAssets.includes(wantedAsset);
+        }
+        case 'group-app': {
+            const groupApps = txn?.apids ?? [];
+            const wantedApp = parameters['app-id'] !== undefined ? Number(parameters['app-id']) : undefined;
+            return wantedApp !== undefined && groupApps.includes(wantedApp);
+        }
+        case 'group-size': {
+            const size = txn?.size ?? 0;
+            const minSize = parameters.min ?? -Infinity;
+            const maxSize = parameters.max ?? Infinity;
+            return size >= minSize && size <= maxSize;
+        }
+
+        case 'stpf-stpf': // Matches any state proof tx
+            return true; // Already matched by main type 'stpf'
+
+        // Add cases for other subtypes
+
+        default:
+            console.warn(`Matching logic not implemented for ${type}-${subtype}`);
+            return false;
+    }
+}
+
+// <<< playTransactionSoundWithUI wraps synthesis module call with UI logic >>>
+// --- Overflow policy ---
+// Each instance may fire up to AGGR_MAX_PER_WINDOW individual triggers per
+// window. Overflow is dropped in Single mode; in Aggr mode it accumulates
+// and collapses into one heavier hit per flush interval, scaled by count.
+const AGGR_WINDOW_MS = 1000;
+const AGGR_FLUSH_MS = 250;
+let aggrMaxPerWindow = 10; // user-settable trigger cap (per synth, per second)
+let aggregationEnabled = false;
+
+function triggerInstanceWithRateLimit(instance, timeOffset, opts = {}) {
+    const now = Date.now();
+    if (!instance._triggerLog) instance._triggerLog = [];
+    while (instance._triggerLog.length && now - instance._triggerLog[0] >= AGGR_WINDOW_MS) {
+        instance._triggerLog.shift();
+    }
+
+    // A card may raise its own ceiling. The MIDI card does, because a player
+    // holding a chord is not the same thing as a busy mempool.
+    const cap = instance.settings?.triggerCap ?? aggrMaxPerWindow;
+    if (instance._triggerLog.length < cap) {
+        instance._triggerLog.push(now);
+        playTransactionSoundWithUI(instance, timeOffset, opts);
+        return;
+    }
+
+    if (!aggregationEnabled) return; // Single mode: overflow is dropped
+    // Aggregation collapses many triggers into one hit, which has to pick a
+    // single pitch — so a transaction that carried its own is dropped instead.
+    // A missed note is better than a chord flattened to the wrong one.
+    if (opts.semitoneOffset !== undefined) return;
+
+    instance._aggrCount = (instance._aggrCount || 0) + 1;
+    if (!instance._aggrTimer) {
+        instance._aggrTimer = setTimeout(() => {
+            const count = instance._aggrCount;
+            instance._aggrCount = 0;
+            instance._aggrTimer = null;
+            if (!count || !instance.toneObjects) return;
+            // One cluster hit: louder and longer the more txs it swallowed
+            const velocity = Math.min(1, 0.6 + count / 40);
+            const durationScale = Math.min(4, 1 + Math.log2(1 + count) / 2);
+            playTransactionSoundWithUI(instance, 0, { velocity, durationScale });
+        }, AGGR_FLUSH_MS);
+    }
+}
+
+// Middle C is the hinge: a note arrives as a semitone offset from it, so the
+// card's own base note decides what middle C sounds like and the keyboard keeps
+// its intervals either way.
+const MIDI_MIDDLE_C = 60;
+
+// What each player sounds like, as last announced. Keyed by the address on
+// their notes, which is the only thing that tells two players apart: the sender
+// is the escrow for everybody.
+const playerVoices = new Map();
+const voiceKey = (player, part) => `${player}#${part}`;
+
+/** How many players have announced a voice, for the UI to report. */
+export const knownVoiceCount = () => playerVoices.size;
+export const getPlayerVoice = (address) => playerVoices.get(address)?.voice ?? null;
+
+// A window handle on who is playing and how they sound. Nothing in the app
+// reads it — it is here so a jam can be inspected from the console, and so an
+// end-to-end test can watch a voice arrive over the real relay.
+if (typeof window !== 'undefined') {
+    window.SOA_MIDI = {
+        voices: () => Array.from(playerVoices, ([key, entry]) => ({ key, player: entry.player, part: entry.part, heardAt: entry.heardAt, voice: entry.voice })),
+        playing: () => remoteInstances.map((r) => ({ player: r.player, part: r.part, engine: r.settings.engine, built: !!r.toneObjects })),
+        spend: () => {
+            const stats = getMidiStats();
+            return { ...stats, algo: (stats.sent * NOTE_FEE_MICROALGOS) / 1e6 };
+        },
+    };
+}
+
+function receiveCarriedVoice(txData, part = 0) {
+    const player = txData?.txn?.arcv;
+    const carried = txData?.txn?.note;
+    // An announcement with no address says "somebody sounds like this", which
+    // is not something anyone can act on.
+    if (!player || typeof carried !== 'string') return;
+    let bytes;
+    try {
+        bytes = Uint8Array.from(atob(carried), (c) => c.charCodeAt(0));
+    } catch {
+        return;
+    }
+    // unpackVoice returns null for anything that isn't a voice, which includes
+    // the ordinary case of a passing transaction whose note field is prose.
+    const voice = unpackVoice(bytes);
+    if (!voice) return;
+
+    // Every note carries its player's whole sound, so almost every one of these
+    // is the sound already on file. Comparing here means a voice is only ever
+    // *applied* when it actually changed — the graph rebuild that costs
+    // anything happens on a knob turn, not on a keypress.
+    // Keyed by player *and* part: one performer sending four tracks is still one
+    // performer, but their tracks are four instruments and must not overwrite
+    // each other's sound.
+    const key = voiceKey(player, part);
+    const known = playerVoices.get(key);
+    const sound = voiceFingerprint(voice);
+    if (known?.sound === sound) {
+        known.heardAt = Date.now();
+        return;
+    }
+    playerVoices.set(key, { voice, sound, player, part, heardAt: Date.now() });
+}
+
+/**
+ * The voice to put on the next note. Every note carries the whole sound: the
+ * fee is flat, so the note field is free space either way, and sending it every
+ * time means anyone who starts listening mid-jam has your voice on the first
+ * note they hear rather than whenever you next happen to change something. It
+ * also removes the question of when to repeat, which is a question with no
+ * good answer.
+ *
+ * Anonymous players are the exception. Their notes carry no address, so a
+ * listener has nothing to file the sound under, and the bytes would say
+ * "somebody sounds like this" to nobody in particular.
+ */
+function voiceForNextNote(instance) {
+    const player = instance.config.parameters?.player?.trim();
+    if (!player) return null;
+    return packVoice(instance.settings, APP_VERSION);
+}
+
+// --- Other people's voices ------------------------------------------------
+//
+// A player's notes should sound the way that player designed them, which means
+// a Tone graph per player rather than per card. They are kept out of
+// activeSynths on purpose: they are not cards, they must never be saved into a
+// preset, reordered, or matched against ordinary transaction rules.
+const REMOTE_VOICE_LIMIT = 4;
+const ANONYMOUS_PLAYER = 'anonymous';
+let remoteInstances = [];
+let remoteVoicesEnabled = true;
+// Blank hears everyone, which is the point of a keyboard nobody holds the keys
+// to. An address here narrows a crowded jam down to one person.
+let soloPlayer = '';
+
+export function setRemoteVoicesEnabled(enabled) {
+    remoteVoicesEnabled = !!enabled;
+    if (!remoteVoicesEnabled) releaseAllRemoteVoices();
+}
+
+export const areRemoteVoicesEnabled = () => remoteVoicesEnabled;
+export const remoteVoiceCount = () => remoteInstances.length;
+
+function setSoloPlayer(address) {
+    soloPlayer = address ?? '';
+    // Voices built for players who are no longer being listened to are just
+    // effects chains rendering silence.
+    if (soloPlayer) {
+        for (const instance of [...remoteInstances]) {
+            if (instance.player !== soloPlayer) releaseRemoteVoice(instance);
+        }
+    }
+}
+
+function releaseRemoteVoice(instance) {
+    disposeSynth(instance.id, remoteInstances);
+    remoteInstances = remoteInstances.filter((r) => r !== instance);
+}
+
+function releaseAllRemoteVoices() {
+    for (const instance of [...remoteInstances]) releaseRemoteVoice(instance);
+}
+
+/**
+ * The graph that plays for one player, built on first hearing them and kept
+ * until someone quieter needs the slot. Returns null while its audio is still
+ * being built, so the note that triggered the build is simply the one that
+ * doesn't get their sound.
+ */
+function remoteVoiceFor(key, entry, player) {
+    let instance = remoteInstances.find((r) => r.key === key);
+
+    if (!instance) {
+        // Slots are finite because each one is a full effects chain rendering
+        // every quantum. The player heard from least recently gives way.
+        if (remoteInstances.length >= REMOTE_VOICE_LIMIT) {
+            const quietest = remoteInstances.reduce((a, b) => (a.heardAt <= b.heardAt ? a : b));
+            releaseRemoteVoice(quietest);
+        }
+        instance = {
+            id: `remote-${key.slice(0, 10)}-${Date.now().toString(36)}`,
+            key,
+            // The key separates a player's parts; the player is who they are,
+            // which is what the "hear one player" filter asks about.
+            player,
+            part: entry.part ?? 0,
+            config: { type: 'midi', subtype: null, parameters: {} },
+            // A player can put twelve notes a second into the mempool; a voice
+            // that stopped at the general cap would drop a third of a fast run.
+            settings: { ...getDefaultInstanceSettings(), ...entry.voice, triggerCap: 24 },
+            toneObjects: null,
+            heardAt: Date.now(),
+            sound: entry.sound,
+        };
+        remoteInstances.push(instance);
+        initializeToneForInstance(instance).catch((err) => {
+            console.warn('Could not build a voice for', key, err);
+            releaseRemoteVoice(instance);
+        });
+        return null;
+    }
+
+    instance.heardAt = Date.now();
+    // Every note carries its player's whole sound, so this is almost always a
+    // no-op. Only an actual change reaches Tone.
+    if (instance.sound !== entry.sound) {
+        instance.sound = entry.sound;
+        applyVoice(instance, entry.voice);
+    }
+    return instance.toneObjects ? instance : null;
+}
+
+function routeMidiNote(carried, txData) {
+    const player = txData?.txn?.arcv ?? null;
+    // Only one browser sent this note, and only that browser can say how long
+    // the round trip took. Claimed once, so a second card doesn't re-report it.
+    const roundTrip = claimRoundTrip(txData?.txn?.xaid);
+    const opts = {
+        semitoneOffset: carried.midiNote - MIDI_MIDDLE_C,
+        velocity: Math.max(0.05, Math.min(1, carried.velocity)),
+    };
+
+    // Your own notes belong to your own card. That is where the sound you are
+    // designing lives, and the LED that tells you the mempool heard you.
+    const mine = player !== null && activeSynths.some(
+        (i) => i.config.type === 'midi' && i.config.parameters?.player === player
+    );
+
+    if (mine) {
+        let matched = 0;
+        activeSynths.forEach((instance) => {
+            if (instance.config.type !== 'midi') return;
+            if (instance.config.parameters?.player !== player) return;
+            // The card that sent this part is the card that sounds it. Without
+            // this, four cards on one address would each play every track.
+            if (cardPart(instance) !== carried.part) return;
+            if (!instance.toneObjects) return;
+            triggerInstanceWithRateLimit(instance, matched * 0.010, opts);
+            matched++;
+        });
+        if (roundTrip !== null) reportMidiRoundTrip(roundTrip);
+        return;
+    }
+
+    // Everyone else goes to the pool, in the sound they designed. A card never
+    // plays another player's notes: hearing four people through one card's
+    // voice was only ever a stand-in for not having their voices yet.
+    if (!remoteVoicesEnabled) return;
+    if (soloPlayer && soloPlayer !== player) return;
+
+    // Anonymous notes carry no address, so they all share one slot and the
+    // house sound. There is nowhere else to file a player with no name.
+    const key = voiceKey(player ?? ANONYMOUS_PLAYER, carried.part);
+    const entry = playerVoices.get(key) ?? { voice: getDefaultInstanceSettings(), sound: 'default' };
+    const voice = remoteVoiceFor(key, entry, player ?? ANONYMOUS_PLAYER);
+    if (voice) triggerInstanceWithRateLimit(voice, 0, opts);
+    if (roundTrip !== null) reportMidiRoundTrip(roundTrip);
+}
+
+const playTransactionSoundWithUI = (instance, timeOffset = 0, opts = {}) => {
+  const { id, settings } = instance;
+
+  // --- SEQUENCER LOGIC (advanced exactly once, here) ---
+  const currentStep = settings.currentStepIndex ?? 0;
+  const sequence = settings.sequence || [0, 0, 0, 0, 0, 0, 0, 0];
+  const sequenceOffset = sequence[currentStep];
+  instance.settings.currentStepIndex = (currentStep + 1) % 8;
+
+  // Use synthesis module for audio generation (create a modified instance without UI logic)
+  const audioInstance = { ...instance };
+  playTransactionSound(audioInstance, timeOffset, { ...opts, sequenceOffset });
+
+  // Keep UI logic: Flash LED and Sequencer Indicator (with same offset)
+  setTimeout(() => {
+    flashLED(id); // Pass instance ID
+    updateSequencerIndicator(id, currentStep); // Pass instance ID
+  }, timeOffset * 1000);
+};
+
+// --- Modify LED/Sequencer functions to use instance ID ---
+
+const flashLED = (instanceId) => {
+  const led = document.getElementById(`led-${instanceId}`);
+  if (!led) return;
+  led.classList.add('active');
+  setTimeout(() => led.classList.remove('active'), 100);
+};
+
+let activeIndicatorTimeouts = {}; // Keep this global for now
+
+const updateSequencerIndicator = (instanceId, stepIndex) => {
+    // Clear previous timeout for this instance if exists
+    if (activeIndicatorTimeouts[instanceId]) {
+        clearTimeout(activeIndicatorTimeouts[instanceId].timeoutId);
+        const oldIndicator = document.getElementById(`${instanceId}-seq-indicator-${activeIndicatorTimeouts[instanceId].stepIndex}`);
+        oldIndicator?.classList.remove('active');
+    }
+
+    const indicator = document.getElementById(`${instanceId}-seq-indicator-${stepIndex}`);
+    if (indicator) {
+        indicator.classList.add('active');
+        const timeoutId = setTimeout(() => {
+            indicator.classList.remove('active');
+            delete activeIndicatorTimeouts[instanceId];
+        }, 150);
+        activeIndicatorTimeouts[instanceId] = { timeoutId, stepIndex };
+    }
+};
+
+// Update the status display
+const updateStatus = (message) => {
+  document.getElementById('status').textContent = message;
+};
+
+// Handle waveform selection
+document.querySelectorAll('.waveform-select').forEach(select => {
+  select.addEventListener('change', (e) => {
+    const type = e.target.id.split('-')[0];
+    const waveform = e.target.value;
+
+    if (activeSynths[type] && activeSynths[type].toneObjects) {
+      activeSynths[type].toneObjects.synth.oscillator.type = waveform;
+    }
+  });
+});
+
+// Handle pitch control changes
+document.querySelectorAll('input[id$="-pitch"]').forEach(input => {
+  input.addEventListener('input', (e) => {
+    const type = e.target.id.split('-')[0];
+    const value = parseInt(e.target.value);
+
+    if (activeSynths[type] && activeSynths[type].toneObjects) {
+      activeSynths[type].toneObjects.synth.oscillator.frequency.value = Tone.Frequency(activeSynths[type].baseNote).transpose(value);
+    }
+  });
+});
+
+// Handle note duration changes
+document.querySelectorAll('input[id$="-note-duration"]').forEach(input => {
+  input.addEventListener('input', (e) => {
+    const type = e.target.id.split('-')[0];
+    const value = parseFloat(e.target.value);
+
+    if (activeSynths[type] && activeSynths[type].toneObjects) {
+      activeSynths[type].toneObjects.synth.envelope.release = value;
+    }
+  });
+});
+
+// <<< Function to load a preset from a file or URL >>>
+async function loadPresetFromSource(source, { deferAudio = false } = {}) {
+    let presetData;
+    let presetName = '';
+
+    try {
+        if (typeof source === 'string') { // It's a URL
+            presetName = source.split('/').pop(); // Get filename
+
+            // Add cache-busting parameter
+            const url = `/${source}?t=${Date.now()}`;
+            const response = await fetch(url);
+
+            const textContent = await response.text();
+
+            if (!response.ok) {
+                console.error(`HTTP error! status: ${response.status}`);
+                throw new Error(`HTTP error! status: ${response.status}.`);
+            }
+
+            presetData = JSON.parse(textContent);
+
+        } else if (source instanceof File) { // It's a File object from input
+            presetName = source.name;
+            const text = await source.text();
+            presetData = JSON.parse(text);
+        } else {
+            throw new Error('Invalid source for preset loading.');
+        }
+
+        // --- Core Loading Logic ---
+        if (!presetData.activeSynths || !Array.isArray(presetData.activeSynths)) {
+            throw new Error('Preset file is missing "activeSynths" array.');
+        }
+
+        readPresetProvenance(presetData, presetName);
+
+        // Clear Current State - more surgically
+        const regularSynths = activeSynths.filter(s => s.id !== 'master');
+        regularSynths.forEach(instance => {
+            // Handle UI-specific cleanup first
+            stopStateProofCountdown(instance.id);
+            // Then dispose synthesis objects
+            disposeSynth(instance.id, activeSynths);
+        });
+        activeSynths = activeSynths.filter(s => s.id === 'master');
+
+        const synthContainer = document.getElementById('synth-container');
+        const regularSynthElements = synthContainer.querySelectorAll('.mini-synth:not(.master-synth)');
+        regularSynthElements.forEach(el => el.remove());
+
+        // Process Loaded Data
+        let targetActiveSynths = presetData.activeSynths.map(loadedInstance => ({
+            ...loadedInstance,
+            settings: foldPitchIntoBaseNote({
+                ...getDefaultInstanceSettings(),
+                ...(loadedInstance.settings || {})
+            }),
+            toneObjects: null
+        }));
+
+        // Update State and Rebuild UI
+        activeSynths.push(...targetActiveSynths);
+
+        targetActiveSynths.forEach(instance => {
+            synthContainer.innerHTML += createSynthHTML(instance);
+            renderParameterArea(instance.id, instance.config.type, instance.config.subtype);
+        });
+
+        // Initialize Audio for New Instances. At boot (URL deep link) no
+        // user gesture has happened yet, so audio init would park on the
+        // autoplay policy — leave toneObjects null; the Play button and
+        // LED-click paths initialize them on demand.
+        if (!deferAudio) {
+            if (!synthsInitialized) { await initAudio(); }
+            for (const instance of targetActiveSynths) {
+                await initializeToneForInstance(instance);
+            }
+        }
+
+        updateStatus(`Preset "${presetName}" loaded`);
+        // URL loads are the premade server presets (read-only); a File
+        // import is an unsaved layout until the user saves it.
+        currentPreset = {
+            name: presetName.replace(/\.json$/, ''),
+            source: typeof source === 'string' ? 'server' : null
+        };
+        if (currentPreset.source === 'server') setPresetUrl(currentPreset.name);
+        else setPresetUrl(null); // file imports aren't reachable by link
+        document.getElementById('load-preset-modal').style.display = 'none';
+
+    } catch (error) {
+        console.error(`Failed to load preset from ${presetName}:`, error);
+        alert(`Error loading preset: ${error.message}`);
+    }
+}
+
+// <<< Function to save the current layout from the top bar >>>
+// What is loaded right now, so Save knows what it would overwrite.
+// source: 'local' (user's localStorage, overwritable) | 'server' (premade,
+// read-only) | null (scratch layout, imported file, NFT).
+let currentPreset = { name: null, source: null };
+
+// --- Shareable preset URLs: one clean path segment for both kinds ---
+// /after-the-breaking (server preset) or /831858054 (NFT asset id — all
+// digits, so the two can share the slot without a prefix).
+const SERVER_PRESETS = ['vanilla', 'block-anxiety', 'ceremony-in-d', 'after-the-breaking', 'null-un-drone'];
+let pendingAssetIdForUrl = null; // asset id of the NFT preset load in flight
+
+// Keep the address bar in sync with what's loaded, so copying the URL is
+// all it takes to share it. Only server presets and NFT assets are
+// reachable by other people; every other load clears the path so a copied
+// URL never lies.
+function setPresetUrl(slug) {
+    try {
+        history.replaceState(null, '', slug ? `/${encodeURIComponent(slug)}` : '/');
+    } catch { /* best-effort; never break a preset load over the URL */ }
+}
+
+// --- PRESET PROVENANCE ---
+//
+// Two different questions, so two fields:
+//
+//   formatVersion - the shape of the preset object. Bump only when a reader has
+//                   to behave differently to parse it. Adding a settings key
+//                   with a sensible default is not a bump.
+//   appVersion    - which build wrote it. This is the one that matters for
+//                   sound: swapping a synth engine or a reverb changes how an
+//                   existing preset renders without touching the schema at all,
+//                   so formatVersion would not move. Keeping the old code path
+//                   alive for old presets requires knowing which they are.
+//
+// Presets minted as NFPresets are immutable on-chain: anything minted before
+// this existed can never be stamped retroactively.
+const PRESET_FORMAT_VERSION = 1;
+
+// What an unstamped preset is assumed to have been written by. Everything
+// without a stamp necessarily predates stamping, and stamping landed in 0.9.0 —
+// so every such preset was authored against 0.9.0-era synths and sounds right on
+// them today. Treating them as 0.9.0 is therefore a statement of fact, not a
+// guess, and it means appVersion is never null for callers to special-case.
+// The `inferred` flag below keeps the distinction available for diagnostics.
+const PRESET_BASELINE_VERSION = '0.9.0';
+
+// Provenance of whatever is currently loaded, for future compatibility branches.
+let loadedPresetProvenance = null;
+
+/**
+ * What wrote the preset that's currently loaded, or null if none has been.
+ *
+ * `appVersion` is always a version string — unstamped presets read as the
+ * baseline (see PRESET_BASELINE_VERSION), so a caller can compare without a null
+ * case. `inferred: true` means it carried no stamp and the baseline was assumed.
+ *
+ * This is the hook for keeping an old engine or effect alive for presets that
+ * were voiced against it.
+ */
+export function getLoadedPresetProvenance() {
+    return loadedPresetProvenance;
+}
+
+function readPresetProvenance(presetData, label = 'preset') {
+    // Unstamped presets are read as the baseline rather than as null, so callers
+    // always get a version to compare. Nothing on disk is rewritten: the stamp
+    // appears the next time the preset is saved, and until then it is inferred
+    // fresh on every load.
+    const inferred = presetData?.appVersion === undefined;
+    const provenance = {
+        formatVersion: presetData?.formatVersion ?? 0,
+        appVersion: presetData?.appVersion ?? PRESET_BASELINE_VERSION,
+        inferred,
+    };
+
+    if (provenance.formatVersion > PRESET_FORMAT_VERSION) {
+        // Forward compatibility: a stale cached build meeting a newer preset.
+        // Load it anyway — unknown keys are ignored — but say so.
+        updateStatus(`"${label}" was saved by a newer version (format ${provenance.formatVersion}) — loading anyway`);
+    }
+
+    loadedPresetProvenance = provenance;
+    return provenance;
+}
+
+function writePreset(presetName, download) {
+    const presetData = {
+        formatVersion: PRESET_FORMAT_VERSION,
+        appVersion: APP_VERSION,
+        activeSynths: activeSynths.filter(instance => instance.id !== 'master').map(instance => ({
+            id: instance.id,
+            config: instance.config,
+            settings: instance.settings
+        }))
+    };
+    const jsonString = JSON.stringify(presetData, null, 4);
+
+    try {
+        const presets = JSON.parse(localStorage.getItem('txSynthPresets') || '{}');
+        presets[presetName] = presetData;
+        localStorage.setItem('txSynthPresets', JSON.stringify(presets));
+        updateStatus(`Preset "${presetName}" saved to My Presets`);
+
+        // === Send compressed preset to parent window for NFT minting ===
+        try {
+            const compressed = btoa(unescape(encodeURIComponent(jsonString)));
+            window.postMessage({ type: 'PRESET_SAVED', preset: compressed }, '*');
+        } catch (err) {
+            console.error('Failed to post compressed preset to parent:', err);
+        }
+    } catch (error) {
+        console.error("Error saving preset to Local Storage:", error);
+        alert("Failed to save preset to Local Storage.");
+        return false;
+    }
+
+    if (download) {
+        try {
+            const blob = new Blob([jsonString], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${presetName}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch(error) {
+            console.error("Failed to download preset file:", error);
+            alert("Could not download the file.");
+        }
+    }
+    return true;
+}
+
+function localPresetNames() {
+    return Object.keys(JSON.parse(localStorage.getItem('txSynthPresets') || '{}'));
+}
+
+function updateSaveModalState() {
+    const label = document.getElementById('current-preset-label');
+    const saveBtn = document.getElementById('save-overwrite-btn');
+    if (!label || !saveBtn) return;
+    if (currentPreset.source === 'local') {
+        label.textContent = `current: ${currentPreset.name}`;
+        saveBtn.disabled = false;
+        saveBtn.title = `Overwrite "${currentPreset.name}"`;
+    } else if (currentPreset.source === 'server') {
+        label.textContent = `current: ${currentPreset.name} (premade)`;
+        saveBtn.disabled = true;
+        saveBtn.title = "Premade presets can't be overwritten — use Save As... or Save a Copy";
+    } else {
+        label.textContent = currentPreset.name
+            ? `current: ${currentPreset.name} (unsaved)`
+            : 'current: unsaved layout';
+        saveBtn.disabled = true;
+        saveBtn.title = 'Nothing saved yet — use Save As...';
+    }
+}
+
+function closeSaveModal() {
+    document.getElementById('save-preset-modal').style.display = 'none';
+    const nameInput = document.getElementById('new-preset-name');
+    if (nameInput) nameInput.value = '';
+    const downloadToggle = document.getElementById('download-json-toggle');
+    if (downloadToggle) downloadToggle.checked = false;
+}
+
+function handleSaveOverwrite() {
+    if (currentPreset.source !== 'local') return; // button is disabled anyway
+    if (writePreset(currentPreset.name, document.getElementById('download-json-toggle').checked)) {
+        closeSaveModal();
+    }
+}
+
+function handleSaveAs() {
+    const presetName = document.getElementById('new-preset-name').value.trim();
+    if (!presetName) {
+        alert('Please enter a preset name.');
+        return;
+    }
+    if (localPresetNames().includes(presetName)
+        && !confirm(`A preset named "${presetName}" already exists. Overwrite it?`)) {
+        return;
+    }
+    if (writePreset(presetName, document.getElementById('download-json-toggle').checked)) {
+        currentPreset = { name: presetName, source: 'local' };
+        setPresetUrl(null); // the layout is a local preset now — the old slug no longer describes it
+        closeSaveModal();
+    }
+}
+
+function handleSaveCopy() {
+    const base = currentPreset.name || 'untitled';
+    const taken = localPresetNames();
+    let candidate = `${base} copy`;
+    for (let n = 2; taken.includes(candidate); n++) candidate = `${base} copy ${n}`;
+    // The copy is a snapshot: the working preset stays the current one.
+    if (writePreset(candidate, document.getElementById('download-json-toggle').checked)) {
+        closeSaveModal();
+    }
+}
+
+// Listen for preset load messages from parent window
+window.addEventListener('message', (e) => {
+  if (e.data?.type === 'LOAD_PRESET_FROM_NFT') {
+    console.log('🎵 Legacy synth received preset from NFT:', e.data.preset);
+    try {
+      // Load the preset directly into the synth
+      loadPresetFromSource(e.data.preset);
+    } catch (error) {
+      console.error('Failed to load preset from NFT:', error);
+      alert('Failed to load preset from NFT');
+    }
+  }
+});
+
+// --- INFO MODAL: how-to guide + changelog ---
+
+const LAST_SEEN_VERSION_KEY = 'txSynthLastSeenVersion';
+
+// Built on first open rather than at boot, so the guide screenshots aren't
+// fetched by visitors who never open the modal.
+let infoPanesBuilt = false;
+
+function buildInfoPanes() {
+    if (infoPanesBuilt) return;
+    infoPanesBuilt = true;
+
+    const howto = document.querySelector('[data-info-pane="howto"]');
+    if (howto) {
+        // Sections that declare a `viewport` are the full-width bars: their shot
+        // spans the row with the text underneath. Everything else is a synth card
+        // narrow enough to sit beside its explanation.
+        howto.innerHTML = GUIDE_SECTIONS.map(section => `
+            <div class="guide-step${section.viewport ? ' guide-step-wide' : ''}">
+                <h3>${section.title}</h3>
+                ${section.selector ? `<img src="/guide/${section.id}.png" alt="${section.title}" loading="lazy">` : ''}
+                <div class="guide-text">${section.body}</div>
+            </div>
+        `).join('');
+    }
+
+    const changelog = document.querySelector('[data-info-pane="changelog"]');
+    if (changelog) {
+        changelog.innerHTML = CHANGELOG.map(entry => `
+            <div class="changelog-entry">
+                <h3>v${entry.version} <span class="changelog-date">${entry.date}</span></h3>
+                <ul>${entry.highlights.map(h => `<li>${h}</li>`).join('')}</ul>
+            </div>
+        `).join('');
+    }
+}
+
+function showInfoTab(tab) {
+    document.querySelectorAll('.info-tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.infoTab === tab);
+    });
+    document.querySelectorAll('.info-pane').forEach(pane => {
+        pane.style.display = pane.dataset.infoPane === tab ? 'block' : 'none';
+    });
+}
+
+function isInfoModalOpen() {
+    const modal = document.getElementById('info-modal');
+    return !!modal && modal.style.display === 'block';
+}
+
+function openInfoModal(tab = 'howto') {
+    buildInfoPanes();
+    showInfoTab(tab);
+    const modal = document.getElementById('info-modal');
+    if (modal) modal.scrollTop = 0;
+    const content = modal?.querySelector('.modal-content');
+    if (content) content.scrollTop = 0;
+    if (modal) modal.style.display = 'block';
+    // Opening the guide counts as having seen this version.
+    dismissVersionBanner();
+}
+
+function closeInfoModal() {
+    const modal = document.getElementById('info-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+// --- VERSION BANNER: shown once per version, then never again ---
+
+function dismissVersionBanner() {
+    try {
+        localStorage.setItem(LAST_SEEN_VERSION_KEY, APP_VERSION);
+    } catch (error) {
+        // Private browsing can refuse writes; the banner still closes for this
+        // session, it just comes back next time. Not worth bothering the user.
+        console.warn('Could not record last seen version:', error);
+    }
+    const banner = document.getElementById('version-banner');
+    if (banner) banner.style.display = 'none';
+}
+
+function isVersionBannerOpen() {
+    const banner = document.getElementById('version-banner');
+    return !!banner && banner.style.display === 'block';
+}
+
+function maybeShowVersionBanner() {
+    const banner = document.getElementById('version-banner');
+    const textEl = document.getElementById('version-banner-text');
+    if (!banner || !textEl) return;
+
+    let lastSeen = null;
+    try {
+        lastSeen = localStorage.getItem(LAST_SEEN_VERSION_KEY);
+    } catch (error) {
+        console.warn('Could not read last seen version:', error);
+    }
+
+    if (lastSeen === APP_VERSION) return; // already caught up
+
+    // One card for everybody who isn't caught up, whether that's a first-ever
+    // visit or a returning user on an older version: what the app is, then what
+    // changed. No point deciding which of the two they need — both are short.
+    //
+    // A bare page load brings up only the master bus, so loading a preset is the
+    // actual first step, not pressing Start.
+    const latest = CHANGELOG[0];
+    let html =
+        '<p class="banner-intro"><strong>Algorand mempool sonification and visualisation.</strong> ' +
+        'Load a preset and press Start or read how to build your own.</p>';
+
+    if (latest?.highlights?.length) {
+        html +=
+            `<p class="banner-whatsnew">What's new in v${latest.version}</p>` +
+            `<ul>${latest.highlights.slice(0, 3).map(h => `<li>${h}</li>`).join('')}</ul>`;
+    }
+
+    textEl.innerHTML = html;
+    banner.style.display = 'block';
+}
+
+// Boot the synth once its markup is in the DOM (called from React)
+let legacySynthBooted = false;
+export async function bootLegacySynth() {
+  if (legacySynthBooted) return;
+  legacySynthBooted = true;
+
+  // --- Get references to all UI elements ---
+  const synthContainer = document.getElementById('synth-container');
+  const addSynthButton = document.getElementById('add-synth');
+  const startBtn = document.getElementById('start-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  const savePresetTopBtn = document.getElementById('save-preset');
+  const loadPresetTopBtn = document.getElementById('load-preset');
+  const mintNfpresetBtn = document.getElementById('mint-nfpreset-btn');
+
+  // Get modal elements
+  const saveModal = document.getElementById('save-preset-modal');
+  const loadModal = document.getElementById('load-preset-modal');
+  const modalPresetButtons = document.getElementById('modal-preset-buttons');
+  const saveModalClose = document.getElementById('save-modal-close');
+  const loadModalClose = document.getElementById('load-modal-close');
+  const infoBtn = document.getElementById('info-btn');
+  const infoModal = document.getElementById('info-modal');
+  const infoModalClose = document.getElementById('info-modal-close');
+  const versionBanner = document.getElementById('version-banner');
+  const saveOverwriteBtn = document.getElementById('save-overwrite-btn');
+  const saveAsBtn = document.getElementById('save-as-btn');
+  const saveCopyBtn = document.getElementById('save-copy-btn');
+  const presetFileInput = document.getElementById('preset-file-input');
+  const toggleAggrBtn = document.getElementById('toggle-aggr-btn');
+
+  // NFT loading elements
+  const loadAssetIdInput = document.getElementById('load-asset-id-input');
+  const loadAssetIdBtn = document.getElementById('load-asset-id-btn');
+  const refreshNftPresetsBtn = document.getElementById('refresh-nft-presets-btn');
+  const userNftPresetsContainer = document.getElementById('user-nft-presets-container');
+  const loadErrorDisplay = document.getElementById('load-error-display');
+  const loadErrorText = document.getElementById('load-error-text');
+
+  // Mint NFPreset click handler
+  mintNfpresetBtn.addEventListener('click', async () => {
+      const nftName = document.getElementById('nfpreset-nft-name').value.trim();
+      const unitName = document.getElementById('nfpreset-unit-name').value.trim();
+      const supply = parseInt(document.getElementById('nfpreset-supply').value) || 1;
+      const ipfsToken = document.getElementById('nfpreset-ipfs-token').value.trim();
+      const imageInput = document.getElementById('nfpreset-image-input');
+
+      if (!nftName) {
+          alert('Please enter an NFT name');
+          return;
+      }
+      if (!unitName) {
+          alert('Please enter a unit name');
+          return;
+      }
+      if (!ipfsToken) {
+          alert('Please enter your Pinata JWT token');
+          return;
+      }
+
+      // Get the preset data
+      const presetData = {
+          activeSynths: activeSynths.filter(instance => instance.id !== 'master').map(instance => ({
+              id: instance.id,
+              config: instance.config,
+              settings: instance.settings
+          })),
+      };
+      const jsonString = JSON.stringify(presetData);
+      const compressed = btoa(unescape(encodeURIComponent(jsonString)));
+
+      // Get the image file if selected
+      let imageFile = null;
+      if (imageInput && imageInput.files && imageInput.files[0]) {
+          imageFile = imageInput.files[0];
+      }
+
+      window.postMessage({
+          type: 'MINT_NFPRESET',
+          preset: compressed,
+          nftName,
+          unitName,
+          supply,
+          ipfsToken,
+          imageFile: imageFile
+      }, '*');
+  });
+
+  // <<< ADDED MISSING FUNCTION DEFINITION HERE >>>
+  function populateLoadModal() {
+      const container = document.getElementById('modal-preset-buttons');
+      container.innerHTML = ''; // Clear previous buttons
+
+      // Every preset gets a row: the load button plus an X. The X only bites on
+      // presets the user saved themselves — shipped ones keep it greyed out so
+      // the row shape stays identical down the list.
+      const addRow = (label, data, deletableName) => {
+          const row = document.createElement('div');
+          row.className = 'preset-row';
+
+          const button = document.createElement('button');
+          button.textContent = label;
+          Object.assign(button.dataset, data);
+
+          const del = document.createElement('button');
+          del.className = 'preset-delete';
+          del.textContent = '×';
+          if (deletableName) {
+              del.dataset.deleteName = deletableName;
+              del.title = `Delete "${deletableName}"`;
+          } else {
+              del.disabled = true;
+              del.title = "Shipped preset — can't be deleted";
+          }
+
+          row.appendChild(button);
+          row.appendChild(del);
+          container.appendChild(row);
+      };
+
+      // Server presets first, then the user's own from localStorage
+      SERVER_PRESETS.forEach(name => addRow(name, { fileName: `presets/${name}.json` }, null));
+      Object.keys(JSON.parse(localStorage.getItem('txSynthPresets') || '{}'))
+          .forEach(name => addRow(name, { presetName: name }, name));
+  }
+
+  function deleteLocalPreset(name) {
+      try {
+          const presets = JSON.parse(localStorage.getItem('txSynthPresets') || '{}');
+          delete presets[name];
+          localStorage.setItem('txSynthPresets', JSON.stringify(presets));
+      } catch (error) {
+          console.error('Error deleting preset from Local Storage:', error);
+          alert('Failed to delete preset from Local Storage.');
+          return;
+      }
+      // The layout on screen stays put, but it no longer has a saved home —
+      // otherwise Save would silently resurrect what was just discarded.
+      if (currentPreset.source === 'local' && currentPreset.name === name) {
+          currentPreset = { name: currentPreset.name, source: null };
+      }
+      updateStatus(`Preset "${name}" deleted`);
+      populateLoadModal();
+  }
+
+//  await initAudio();
+
+  // Start empty, then add Master
+  activeSynths = [];
+  synthContainer.innerHTML = '';
+
+  // Create and add the master synth
+  const masterSynthHTML = createMasterSynthHTML();
+  synthContainer.innerHTML += masterSynthHTML;
+
+  // Add a placeholder for the master synth in the active synths array
+  // This allows it to be found/excluded by other functions without needing full settings.
+  activeSynths.push({
+      id: 'master',
+      config: {},
+      settings: getDefaultInstanceSettings(), // Give master proper settings
+      toneObjects: null // Master FX chain will be handled separately
+  });
+
+  addSynthButton.addEventListener('click', async () => {
+    const uniqueId = `synth-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const newInstance = {
+        id: uniqueId,
+        config: { type: null, subtype: null, parameters: {} },
+        settings: getDefaultInstanceSettings(),
+        toneObjects: null
+    };
+    activeSynths.push(newInstance);
+    console.log("Added new synth instance to state:", newInstance);
+
+    const newSynthHTML = createSynthHTML(newInstance);
+    synthContainer.insertAdjacentHTML('beforeend', newSynthHTML);
+
+    await initializeToneForInstance(newInstance);
+    renderParameterArea(newInstance.id, null, null);
+  });
+
+  // Hearing other people is an instrument-wide question, not a per-card one:
+  // their notes arrive with their own sound, so there is no card whose voice
+  // the choice belongs to.
+  const toggleOthersBtn = document.getElementById('toggle-others-btn');
+  const othersFilter = document.getElementById('others-filter');
+
+  toggleOthersBtn?.addEventListener('click', () => {
+    setRemoteVoicesEnabled(!areRemoteVoicesEnabled());
+    const on = areRemoteVoicesEnabled();
+    // State in the label, the same way its neighbour says Mode: Single — the
+    // buttons in this bar all share one fill, so a colour would say nothing.
+    toggleOthersBtn.textContent = on ? 'Others: on' : 'Others: off';
+    // A filter over playing nobody hears is a control that does nothing.
+    if (othersFilter) othersFilter.disabled = !on;
+  });
+
+  othersFilter?.addEventListener('change', async () => {
+    const typed = othersFilter.value.trim();
+    if (typed === '') {
+      setSoloPlayer('');
+      othersFilter.classList.remove('invalid-address');
+      othersFilter.title = 'Hear only this player — an address or a name.algo. Blank hears everyone.';
+      return;
+    }
+    if (looksLikeNfd(typed)) {
+      othersFilter.classList.remove('invalid-address');
+      othersFilter.title = 'looking up…';
+      try {
+        const { name, address } = await resolveNfd(typed);
+        setSoloPlayer(address);
+        othersFilter.value = name;
+        othersFilter.title = address;
+      } catch (err) {
+        setSoloPlayer('');
+        othersFilter.classList.add('invalid-address');
+        othersFilter.title = String(err?.message ?? err);
+      }
+      return;
+    }
+    const valid = isValidPlayer(typed);
+    othersFilter.classList.toggle('invalid-address', !valid);
+    othersFilter.title = valid ? typed : 'Not an Algorand address';
+    setSoloPlayer(valid ? typed : '');
+  });
+
+  // A MIDI card is built here rather than picked from the Type menu: it is not
+  // a filter over the feed like the others, and putting it in that menu would
+  // offer it to every card and add a counter that never moves for anyone who
+  // isn't playing.
+  document.getElementById('add-midi')?.addEventListener('click', async () => {
+    const uniqueId = `synth-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const newInstance = {
+        id: uniqueId,
+        config: { type: 'midi', subtype: null, parameters: { player: '' } },
+        settings: {
+            ...getDefaultInstanceSettings(),
+            // Middle C is the hinge the incoming offsets are measured from, so
+            // the card's base note is what middle C will sound like.
+            baseNote: 'C4',
+            // Polyphonic and a little longer than a mempool blip: chords arrive
+            // as a group, and a note you played deserves to ring.
+            engine: 'polysynth',
+            noteDuration: 0.4,
+            // A held chord is not a busy mempool. The general cap would eat it.
+            triggerCap: 24,
+        },
+        toneObjects: null
+    };
+    activeSynths.push(newInstance);
+
+    synthContainer.insertAdjacentHTML('beforeend', createSynthHTML(newInstance));
+    await initializeToneForInstance(newInstance);
+    renderParameterArea(uniqueId, 'midi', null);
+  });
+
+  // Attach main control listeners
+  startBtn.addEventListener('click', async () => {
+    try { await unlockIOSAudioOnce?.(); } catch {}
+    startTransactionStream();
+  });
+  stopBtn.addEventListener('click', () => {
+    stopTransactionStream();
+  });
+
+  // --- MODAL LISTENERS ---
+  loadPresetTopBtn.addEventListener('click', () => {
+      populateLoadModal();
+      loadModal.style.display = 'block';
+      // Auto-load user's NFT presets when modal opens
+      if (refreshNftPresetsBtn) {
+        refreshNftPresetsBtn.click();
+      }
+  });
+  savePresetTopBtn.addEventListener('click', () => {
+      updateSaveModalState();
+      saveModal.style.display = 'block';
+  });
+
+  // Close modals
+  loadModalClose.addEventListener('click', () => { loadModal.style.display = 'none'; });
+  saveModalClose.addEventListener('click', () => { saveModal.style.display = 'none'; });
+  window.addEventListener('click', (event) => {
+      if (event.target == loadModal) loadModal.style.display = 'none';
+      if (event.target == saveModal) saveModal.style.display = 'none';
+      if (event.target == infoModal) closeInfoModal();
+      if (event.target == versionBanner) dismissVersionBanner();
+  });
+
+  // --- INFO MODAL + VERSION BANNER LISTENERS ---
+  infoBtn.addEventListener('click', () => openInfoModal('howto'));
+  infoModalClose.addEventListener('click', closeInfoModal);
+  infoModal.querySelector('.info-tabs').addEventListener('click', (event) => {
+      const tab = event.target.dataset.infoTab;
+      if (tab) showInfoTab(tab);
+  });
+  document.getElementById('version-banner-dismiss').addEventListener('click', dismissVersionBanner);
+  document.getElementById('version-banner-link').addEventListener('click', () => openInfoModal('howto'));
+  document.getElementById('version-banner-changelog').addEventListener('click', () => openInfoModal('changelog'));
+
+  // Listener for buttons inside the load modal
+  modalPresetButtons.addEventListener('click', (event) => {
+      const target = event.target;
+      if (target.tagName !== 'BUTTON') return;
+
+      if (target.classList.contains('preset-delete')) {
+          const name = target.dataset.deleteName;
+          if (name && confirm(`Delete preset "${name}"? This can't be undone.`)) {
+              deleteLocalPreset(name);
+          }
+          return; // never fall through to a load
+      }
+
+      if (target.dataset.fileName) { // For server presets
+          loadPresetFromSource(target.dataset.fileName);
+          loadModal.style.display = 'none'; // Close modal after loading
+      } else if (target.dataset.presetName) { // For user presets from localStorage
+          loadPresetFromLocalStorage(target.dataset.presetName);
+          loadModal.style.display = 'none';
+      }
+  });
+
+  saveOverwriteBtn.addEventListener('click', handleSaveOverwrite);
+  saveAsBtn.addEventListener('click', handleSaveAs);
+  saveCopyBtn.addEventListener('click', handleSaveCopy);
+
+  presetFileInput.addEventListener('change', (event) => {
+      const file = event.target.files[0];
+      if (file) {
+          loadPresetFromSource(file);
+      }
+      event.target.value = null;
+  });
+
+  initializeEventListeners();
+  startMeterLoop();
+  startStallCounter();
+  startLoadReadout();
+  // Debug/test hooks (activeSynths itself is reassigned on preset load)
+  window.getActiveSynths = () => activeSynths;
+  window.musicBoxTest = { addTx: musicBoxAddTx, addBlock: musicBoxAddBlock };
+  initXenakisViz(document.getElementById('xenakis-canvas'));
+  initLoomViz(document.getElementById('loom-canvas'));
+  initKintsugiViz(document.getElementById('kintsugi-canvas'));
+  initMusicBoxViz(document.getElementById('musicbox-canvas'));
+  initTerritoryViz(document.getElementById('territory-root'));
+  window.territoryTest = { addTx: territoryAddTx, addBlock: territoryAddBlock };
+
+  // Visualization overlay: pick one from the menu to take over the screen;
+  // click the open viz, pick the menu's own name again, or press Escape, to
+  // leave. The menu is where eight buttons used to be — they were the widest
+  // thing in the bar and only ever one of them was in use.
+  const vizSelect = document.getElementById('viz-select');
+  let vizOverlayOpen = false;
+  const openViz = (target) => {
+      if (vizSelect) vizSelect.value = target;
+      document.getElementById('viz-score').style.display = target === 'score' ? '' : 'none';
+      document.getElementById('viz-loom').style.display = target === 'loom' ? '' : 'none';
+      document.getElementById('viz-kintsugi').style.display = target === 'kintsugi' ? '' : 'none';
+      document.getElementById('viz-musicbox').style.display = target === 'musicbox' ? '' : 'none';
+      document.getElementById('viz-territory').style.display = target === 'territory' ? '' : 'none';
+      vizOverlayOpen = true;
+  };
+  const closeViz = () => {
+      if (!vizOverlayOpen) return;
+      if (vizSelect) vizSelect.value = '';
+      document.getElementById('viz-score').style.display = 'none';
+      document.getElementById('viz-loom').style.display = 'none';
+      document.getElementById('viz-kintsugi').style.display = 'none';
+      document.getElementById('viz-musicbox').style.display = 'none';
+      document.getElementById('viz-territory').style.display = 'none';
+      vizOverlayOpen = false;
+  };
+  vizSelect?.addEventListener('change', () => {
+      // The first entry is the menu's own name, so choosing it means "none".
+      if (vizSelect.value) openViz(vizSelect.value);
+      else closeViz();
+  });
+  document.getElementById('viz-score').addEventListener('click', closeViz);
+  document.getElementById('viz-loom').addEventListener('click', closeViz);
+  document.getElementById('viz-kintsugi').addEventListener('click', closeViz);
+  document.getElementById('viz-musicbox').addEventListener('click', closeViz);
+  document.getElementById('viz-territory').addEventListener('click', closeViz);
+
+  // Global keyboard conventions: Escape leaves the viz overlay, Space is
+  // play/stop everywhere else — the media-player convention (YouTube,
+  // Spotify). Skipped only in genuine text-entry contexts, since typing a
+  // literal space must still work; a focused button does NOT exempt it
+  // (Enter remains available for keyboard button activation).
+  document.addEventListener('keydown', (e) => {
+      // The info modal sits on top of everything, so it gets first refusal on
+      // Escape — otherwise this would close a viz the user can't even see.
+      if (e.key === 'Escape' && isInfoModalOpen()) { closeInfoModal(); return; }
+      if (e.key === 'Escape' && isVersionBannerOpen()) { dismissVersionBanner(); return; }
+      if (e.key === 'Escape') { closeViz(); return; }
+      if (e.code !== 'Space') return;
+      // Reading the guide is not a cue to start playing. Buttons don't exempt
+      // themselves from the rule below, and the modals are full of them.
+      if (isInfoModalOpen() || isVersionBannerOpen()) return;
+      const el = document.activeElement;
+      const tag = el?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) return;
+      e.preventDefault();
+      if (isPlaying) stopTransactionStream();
+      else startBtn.click(); // reuses the button's own audio-unlock + start logic
+  });
+
+  updateStatus('Ready');
+  initializeTypeCounts();
+  injectSliderStyles();
+  loadPersistentCounters();
+
+  const footerVersion = document.getElementById('footer-version');
+  if (footerVersion) footerVersion.textContent = `v${APP_VERSION}`;
+  const infoVersion = document.getElementById('info-version');
+  if (infoVersion) infoVersion.textContent = `v${APP_VERSION}`;
+  maybeShowVersionBanner();
+
+  // Deep links from shared URLs: /<name> loads a premade server preset,
+  // /<digits> loads a minted NFT preset by asset id (indexer lookup —
+  // works without a wallet). Audio stays untouched until the first
+  // gesture, so the visitor lands on the loaded preset and just presses Play.
+  const slug = decodeURIComponent(window.location.pathname.replace(/^\/+|\/+$/g, ''));
+  if (SERVER_PRESETS.includes(slug)) {
+      loadPresetFromSource(`presets/${slug}.json`, { deferAudio: true });
+  } else if (/^\d+$/.test(slug)) {
+      pendingAssetIdForUrl = slug;
+      window.postMessage({ type: 'REQUEST_NFPRESET_LOAD', assetId: parseInt(slug, 10) }, '*');
+  }
+
+  // <<< Aggregation mode toggle: label shows the ACTIVE mode >>>
+  toggleAggrBtn.disabled = false;
+  toggleAggrBtn.textContent = 'Mode: Single';
+  toggleAggrBtn.title = 'Overflow policy above the per-synth rate cap: drop (Single) or collapse into cluster hits (Aggr)';
+  toggleAggrBtn.addEventListener('click', () => {
+      aggregationEnabled = !aggregationEnabled;
+      toggleAggrBtn.textContent = aggregationEnabled ? 'Mode: Aggr' : 'Mode: Single';
+  });
+
+  // Trigger cap input lives next to the mode button (horizontal, no new row)
+  const aggrCapInput = document.getElementById('aggr-cap-input');
+  if (aggrCapInput) {
+      aggrCapInput.value = aggrMaxPerWindow;
+      aggrCapInput.addEventListener('change', () => {
+          const v = parseInt(aggrCapInput.value, 10);
+          if (Number.isFinite(v) && v >= 1 && v <= 100) {
+              aggrMaxPerWindow = v;
+          } else {
+              aggrCapInput.value = aggrMaxPerWindow;
+          }
+      });
+  }
+
+  // Initialize state proof countdown
+  await initializeStateProofCountdown();
+
+  // Load by Asset ID functionality
+  loadAssetIdBtn?.addEventListener('click', async () => {
+    const assetId = loadAssetIdInput?.value.trim();
+    if (!assetId) {
+      showLoadError('Please enter an Asset ID');
+      return;
+    }
+
+    const assetIdNum = parseInt(assetId);
+    if (isNaN(assetIdNum)) {
+      showLoadError('Please enter a valid Asset ID (number)');
+      return;
+    }
+
+    try {
+      hideLoadError();
+      loadAssetIdBtn.textContent = 'Loading...';
+      loadAssetIdBtn.disabled = true;
+
+      // Request preset from React
+      pendingAssetIdForUrl = String(assetIdNum);
+      window.postMessage({
+        type: 'REQUEST_NFPRESET_LOAD',
+        assetId: assetIdNum
+      }, '*');
+
+    } catch (error) {
+      console.error('Failed to load preset by Asset ID:', error);
+      showLoadError(`Failed to load preset: ${error.message}`);
+    } finally {
+      loadAssetIdBtn.textContent = 'Load';
+      loadAssetIdBtn.disabled = false;
+    }
+  });
+
+  // Refresh user's NFT presets
+  refreshNftPresetsBtn?.addEventListener('click', async () => {
+    try {
+      refreshNftPresetsBtn.textContent = 'Refreshing...';
+      refreshNftPresetsBtn.disabled = true;
+
+      // Request user's preset NFTs from React
+      window.postMessage({
+        type: 'REQUEST_NFPRESET_LIST'
+      }, '*');
+
+    } catch (error) {
+      console.error('Failed to refresh NFT presets:', error);
+      showLoadError('Failed to refresh your preset NFTs');
+    } finally {
+      refreshNftPresetsBtn.textContent = 'Refresh';
+      refreshNftPresetsBtn.disabled = false;
+    }
+  });
+
+  // Load user NFT preset when clicked
+  function handleUserNftPresetClick(assetId) {
+    try {
+      // Request preset from React
+      pendingAssetIdForUrl = String(parseInt(assetId));
+      window.postMessage({
+        type: 'REQUEST_NFPRESET_LOAD',
+        assetId: parseInt(assetId)
+      }, '*');
+    } catch (error) {
+      console.error('Failed to load user NFT preset:', error);
+      showLoadError(`Failed to load preset: ${error.message}`);
+    }
+  }
+
+  // Make function globally accessible for inline onclick
+  window.handleUserNftPresetClick = handleUserNftPresetClick;
+
+  // Function to load image from IPFS
+  async function loadIpfsImage(ipfsHash) {
+    if (!ipfsHash) return '/nfplaceholder.png';
+
+    try {
+      const response = await fetch(`https://gateway.pinata.cloud/ipfs/${ipfsHash}`);
+      if (response.ok) {
+        return `https://gateway.pinata.cloud/ipfs/${ipfsHash}`;
+      }
+    } catch (error) {
+      console.warn(`Failed to fetch from IPFS:`, error);
+    }
+
+    return '/nfplaceholder.png';
+  }
+
+  // Display user's NFT presets as thumbnails
+  async function displayUserNftPresets(presets) {
+    if (!userNftPresetsContainer) return;
+
+    if (!presets || presets.length === 0) {
+      userNftPresetsContainer.innerHTML = `
+        <div style="text-align: center; padding: 20px; color: #666; font-size: 14px;">
+          <p>No preset NFTs found in your wallet</p>
+          <p style="font-size: 12px; margin-top: 4px;">Mint some presets first to see them here</p>
+        </div>
+      `;
+      return;
+    }
+
+    // Show loading spinner while processing
+    userNftPresetsContainer.innerHTML = `
+      <div style="text-align: center; padding: 40px;">
+        <svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <style>
+            .spinner_jCIR{animation:spinner_B8Vq .9s linear infinite;animation-delay:-.9s}
+            .spinner_upm8{animation-delay:-.8s}
+            .spinner_2eL5{animation-delay:-.7s}
+            .spinner_Rp9l{animation-delay:-.6s}
+            .spinner_dy3W{animation-delay:-.5s}
+            @keyframes spinner_B8Vq{0%,66.66%{animation-timing-function:cubic-bezier(0.36,.61,.3,.98);y:6px;height:12px}33.33%{animation-timing-function:cubic-bezier(0.36,.61,.3,.98);y:1px;height:22px}}
+          </style>
+          <rect class="spinner_jCIR" x="1" y="6" width="2.8" height="12"/>
+          <rect class="spinner_jCIR spinner_upm8" x="5.8" y="6" width="2.8" height="12"/>
+          <rect class="spinner_jCIR spinner_2eL5" x="10.6" y="6" width="2.8" height="12"/>
+          <rect class="spinner_jCIR spinner_Rp9l" x="15.4" y="6" width="2.8" height="12"/>
+          <rect class="spinner_jCIR spinner_dy3W" x="20.2" y="6" width="2.8" height="12"/>
+        </svg>
+        <p style="margin-top: 10px; color: #666; font-size: 12px;">Loading...</p>
+      </div>
+    `;
+
+    // Process presets to get thumbnail URLs
+    const presetsWithThumbnails = await Promise.all(presets.map(async (preset) => {
+      let thumbnailUrl = '/nfplaceholder.png';
+
+      // Debug: log the preset URL to see what's being processed
+      console.log(`Processing preset ${preset.id}:`, preset.url);
+
+      // Extract IPFS hash from preset URL
+      if (preset.url && preset.url !== 'ipfs://QmPlaceholder#arc3') {
+        const ipfsMatch = preset.url.match(/ipfs:\/\/([^#]+)/);
+        if (ipfsMatch) {
+          const metadataHash = ipfsMatch[1];
+
+          // Check if this looks like a valid IPFS hash (should be 46+ characters for CIDv0)
+          if (metadataHash.length < 10 || metadataHash === 'QmPlaceholder') {
+            console.warn(`Skipping invalid IPFS hash for preset ${preset.id}: ${metadataHash}`);
+          } else {
+            try {
+              console.log(`Fetching metadata from IPFS: ${metadataHash}`);
+              // Fetch metadata to get image URL
+              const metadataResponse = await fetch(`https://gateway.pinata.cloud/ipfs/${metadataHash}`);
+              if (metadataResponse.ok) {
+                const metadata = await metadataResponse.json();
+                console.log(`Metadata for preset ${preset.id}:`, metadata);
+                if (metadata.image) {
+                  const imageMatch = metadata.image.match(/ipfs:\/\/([^#]+)/);
+                  if (imageMatch) {
+                    const imageHash = imageMatch[1];
+                    console.log(`Loading image for preset ${preset.id}: ${imageHash}`);
+                    thumbnailUrl = await loadIpfsImage(imageHash);
+                  }
+                }
+              } else {
+                console.warn(`Failed to fetch metadata for preset ${preset.id}: ${metadataResponse.status}`);
+              }
+            } catch (error) {
+              console.warn(`Error fetching metadata for preset ${preset.id}:`, error);
+            }
+          }
+        }
+      } else if (preset.url === 'ipfs://QmPlaceholder#arc3') {
+        console.log(`Preset ${preset.id} has placeholder URL, skipping IPFS fetch`);
+      }
+
+      return { ...preset, thumbnailUrl };
+    }));
+
+    const presetsHtml = presetsWithThumbnails.map(preset => `
+      <div
+        class="nft-preset-item"
+        style="border: 1px solid #ddd; border-radius: 4px; padding: 4px; margin-bottom: 8px; background: transparent; display: inline-block; width: 96px; height: 120px; margin-right: 8px; vertical-align: top; overflow: hidden;"
+      >
+        <div style="text-align: center; height: 100%;">
+          <img
+            src="${preset.thumbnailUrl}"
+            alt="${preset.name || `Asset ${preset.id}`}"
+            style="width: 88px; height: 88px; object-fit: contain; border-radius: 2px; cursor: pointer; display: block; margin: 0 auto 2px auto;"
+            onclick="handleUserNftPresetClick(${preset.id})"
+            onerror="this.src='/nfplaceholder.png'"
+          />
+          <h4 style="font-weight: 500; margin: 0 0 1px 0; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.1;">${preset.name || `Asset ${preset.id}`}</h4>
+          <p style="font-size: 8px; color: #666; margin: 0 0 1px 0;">
+            ID: ${preset.id}
+          </p>
+          <p style="font-size: 7px; color: #999; margin: 0;">
+            Synths: ${preset.preset?.activeSynths?.length || 0}
+          </p>
+        </div>
+      </div>
+    `).join('');
+
+    userNftPresetsContainer.innerHTML = presetsHtml;
+  }
+
+  // Error handling functions
+  function showLoadError(message) {
+    if (loadErrorText) {
+      loadErrorText.textContent = message;
+    }
+    if (loadErrorDisplay) {
+      loadErrorDisplay.style.display = 'block';
+    }
+  }
+
+  function hideLoadError() {
+    if (loadErrorDisplay) {
+      loadErrorDisplay.style.display = 'none';
+    }
+  }
+
+  // Make error functions globally accessible
+  window.showLoadError = showLoadError;
+  window.hideLoadError = hideLoadError;
+  window.loadNftPreset = loadNftPreset;
+
+  // Wallet button (was an inline script in legacy.html)
+  document.getElementById('wallet-connect')?.addEventListener('click', () => {
+    window.postMessage({ type: 'OPEN_WALLET_MODAL' }, '*');
+  });
+
+  // Listen for messages from React
+  window.addEventListener('message', (event) => {
+    if (event.data.type === 'NFPRESET_LIST') {
+      displayUserNftPresets(event.data.presets);
+    } else if (event.data.type === 'NFPRESET_LOAD_RESULT') {
+      if (event.data.success) {
+        // Load the preset into the synth using the new function
+        loadNftPreset(event.data.preset);
+      } else {
+        showLoadError('Failed to load preset from NFT');
+      }
+    }
+  });
+}
+
+// <<< initializeEventListeners Uses Event Delegation >>>
+const initializeEventListeners = () => {
+    const synthContainer = document.getElementById('synth-container');
+    if (!synthContainer) {
+        console.error("Synth container not found for event listeners.");
+        return;
+    }
+
+    // Remove old listeners first to prevent duplicates if called multiple times
+    synthContainer.removeEventListener('click', handleContainerClick);
+    synthContainer.removeEventListener('change', handleContainerChange);
+    synthContainer.removeEventListener('input', handleContainerInput);
+
+    // Add new delegated listeners
+    synthContainer.addEventListener('click', handleContainerClick);
+    synthContainer.addEventListener('change', handleContainerChange);
+    synthContainer.addEventListener('input', handleContainerInput);
+    synthContainer.addEventListener('keydown', handleContainerKeydown);
+
+    // Drag-to-reorder, on the grab strip. The module moves the cards; the
+    // order of activeSynths has to follow, because that array is what a preset
+    // is written from and what it is rebuilt into — if the two disagree, a
+    // layout saved after a drag comes back in the order it had before.
+    initCardReorder(synthContainer, {
+        // What a card is called when there is no screen to look at. The label
+        // first, because that is the name its author gave it; otherwise the
+        // rule it listens for, which is the next most useful thing to hear. An
+        // untouched card says so rather than reading out its generated id.
+        describe: (id) => {
+            const instance = findInstance(id);
+            if (!instance) return 'synth';
+            const { type, subtype, parameters } = instance.config ?? {};
+            const label = parameters?.label?.trim();
+            if (label) return `${label}, ${type ?? 'unset'} synth`;
+            if (!type) return 'unconfigured synth';
+            return subtype ? `${type} ${subtype} synth` : `${type} synth`;
+        },
+        onReorder: (ids) => {
+            const byId = new Map(activeSynths.map((s) => [s.id, s]));
+            const reordered = ids.map((id) => byId.get(id)).filter(Boolean);
+            // Anything the DOM didn't account for keeps its place at the back
+            // rather than being dropped: losing a synth to a reorder would be a
+            // far worse failure than an odd position.
+            for (const instance of activeSynths) {
+                if (!reordered.includes(instance)) reordered.push(instance);
+            }
+            activeSynths = reordered;
+        },
+    });
+
+    console.log("Delegated event listeners attached to synthContainer.");
+};
+
+// --- Delegated Event Handlers ---
+
+// Click-to-audition: fire a synth by hand (rare types like hb can be hours
+// apart). Initializes audio on demand, so it works before the stream starts.
+async function testFireSynth(instanceId) {
+    const instance = findInstance(instanceId);
+    if (!instance || instance.id === 'master') return;
+    if (!instance.toneObjects) {
+        try { await initializeToneForInstance(instance); } catch (err) {
+            console.error('Could not initialize audio for test trigger:', err);
+            return;
+        }
+    }
+    if (instance.toneObjects) playTransactionSoundWithUI(instance, 0);
+}
+
+// Switch which tab-content of the ADSR/extras section is visible. Purely
+// a UI preference — stored on the instance itself, not settings, so it
+// never leaks into saved presets (writePreset only copies id/config/settings).
+function handleTabChangeLogic(instanceId, tab, synthElement) {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    instance._activeTab = tab;
+    const adsrSection = synthElement.querySelector('.adsr-section');
+    if (adsrSection) adsrSection.outerHTML = renderAdsrSection(instanceId, instance.settings, tab);
+}
+
+// Swap the voice's engine (Synth/MonoSynth/PolySynth/AM/FM). Rebuilds only
+// the voice — vibrato/filter/delay/reverb send/panner/meter are untouched
+// — and re-renders the ADSR section since the available tabs depend on
+// which engine is selected.
+async function handleEngineChangeLogic(instanceId, engine, synthElement) {
+    const instance = findInstance(instanceId);
+    if (!instance || instance.settings.engine === engine) return;
+    instance.settings.engine = engine;
+    instance._activeTab = 'adsr'; // reset to a tab that always exists
+    synthElement.querySelectorAll('.engine-btn').forEach(b => b.classList.toggle('active', b.dataset.engine === engine));
+    const adsrSection = synthElement.querySelector('.adsr-section');
+    if (adsrSection) adsrSection.outerHTML = renderAdsrSection(instanceId, instance.settings, 'adsr');
+    await rebuildVoice(instance);
+}
+
+// --- MIDI card ------------------------------------------------------------
+
+// The last round trip this browser measured: the time between putting a note
+// into the mempool and hearing it come back. It is the honest latency of the
+// instrument, so it is shown rather than hidden.
+let midiLastRoundTrip = null;
+let midiEscrowBalance = null;
+
+// Every note this instrument can send costs the network minimum, and the escrow
+// program refuses to sign one that offers more.
+const NOTE_FEE_MICROALGOS = 1000;
+
+function reportMidiRoundTrip(ms) {
+    midiLastRoundTrip = ms;
+    refreshMidiStatus();
+}
+
+// The hat empties one note at a time, and every one of those notes goes past
+// this browser on the way back. So the readout is driven by what is heard
+// rather than by asking: a keypress anywhere in the world moves the number
+// here, at the same moment you hear the note that spent it.
+function spendFromEscrow() {
+    if (midiEscrowBalance === null) return;
+    midiEscrowBalance = Math.max(0, midiEscrowBalance - NOTE_FEE_MICROALGOS);
+    refreshMidiStatus();
+}
+
+// Counting what we hear drifts: the stream can be stopped, a relay can miss a
+// transaction, and a hat can be topped up by someone who is not playing. So the
+// count is corrected against the chain on a slow timer — often enough that the
+// number is never far wrong, rarely enough to be nothing to a public node.
+const ESCROW_RESYNC_MS = 45_000;
+let escrowWatchTimer = null;
+
+async function resyncEscrowBalance() {
+    const micro = await getKeyboardBalance();
+    if (micro === null) return; // a failed read is not a balance of nothing
+    midiEscrowBalance = micro;
+    refreshMidiStatus();
+}
+
+function startEscrowWatch() {
+    if (escrowWatchTimer) return;
+    resyncEscrowBalance();
+    escrowWatchTimer = setInterval(() => {
+        // A hidden tab is nobody watching a number. Resume on the next look.
+        if (document.visibilityState === 'hidden') return;
+        resyncEscrowBalance();
+    }, ESCROW_RESYNC_MS);
+}
+
+function stopEscrowWatchIfUnwatched() {
+    if (activeSynths.some((i) => i.config.type === 'midi')) return;
+    clearInterval(escrowWatchTimer);
+    escrowWatchTimer = null;
+}
+
+function refreshMidiStatus() {
+    // Abbreviated because the card is about twenty-eight characters wide at this
+    // size, and two facts about the instrument on one line is worth more than
+    // two spelled-out labels on two.
+    const balance = midiEscrowBalance === null ? '—' : `${(midiEscrowBalance / 1e6).toFixed(3)}`;
+    const latency = midiLastRoundTrip === null ? '—' : `${midiLastRoundTrip}ms`;
+    const stats = getMidiStats();
+    const lines = [`bal. ${balance} · lat. ${latency}`];
+
+    // What the hat holds is everyone's; what you have spent is yours. An
+    // arpeggiator or a running sequencer bills you a note at a time without a
+    // finger moving, and the first you would otherwise know of it is an empty
+    // hat, so the count is worth its line on the card while it is happening.
+    if (stats.sent > 0) {
+        const spent = (stats.sent * NOTE_FEE_MICROALGOS) / 1e6;
+        const note = stats.sent === 1 ? 'note' : 'notes';
+        lines.push(`you: ${stats.sent} ${note}, ${spent.toFixed(3)} ALGO`);
+    }
+    // Dropped notes cost nothing, but you pressed a key and heard silence, which
+    // is worth saying rather than leaving you to wonder whether it went out.
+    if (stats.dropped) lines.push(`${stats.dropped} over the rate cap`);
+    if (stats.failed) lines.push(`${stats.failed} rejected`);
+
+    const text = lines.join('\n');
+    // The address has to be reachable from the card: it is the only way anyone
+    // can put money in the hat, and it is too long to show without spending a
+    // line on it. The tooltip holds it, a click copies it.
+    const escrow = getKeyboardAddress();
+    activeSynths.forEach((instance) => {
+        if (instance.config.type !== 'midi') return;
+        const el = document.getElementById(`${instance.id}-midi-status`);
+        if (!el || el.dataset.flashing === 'true') return;
+        el.textContent = text;
+        el.title = `bal. is the escrow balance; lat. is how long a note takes to come back.\n\nEscrow ${escrow}\nClick to copy — top it up to keep playing.`;
+    });
+}
+
+async function copyEscrowAddress(el) {
+    const address = getKeyboardAddress();
+    try {
+        await navigator.clipboard.writeText(address);
+    } catch {
+        return; // a browser that refuses the clipboard still has the tooltip
+    }
+    el.dataset.flashing = 'true';
+    el.textContent = 'escrow address copied';
+    setTimeout(() => {
+        delete el.dataset.flashing;
+        refreshMidiStatus();
+    }, 1400);
+}
+
+async function initializeMidiCard(instanceId) {
+    const select = document.getElementById(`${instanceId}-midi-device`);
+    const status = document.getElementById(`${instanceId}-midi-status`);
+
+    startEscrowWatch();
+
+    if (!midiSupported()) {
+        if (select) select.disabled = true;
+        if (status) status.textContent = 'This browser has no Web MIDI — try Chrome, Edge or Firefox.';
+        return;
+    }
+
+    try {
+        const inputs = await listMidiInputs();
+        if (!select) return;
+        for (const input of inputs) {
+            const option = document.createElement('option');
+            option.value = input.id;
+            option.textContent = input.name;
+            select.appendChild(option);
+        }
+        // The device list arrives after the card is drawn, so a card that
+        // already had one selected has to be given it back.
+        const held = findInstance(instanceId)?._midiDevice;
+        if (held) select.value = held;
+        if (inputs.length === 0 && status) status.textContent = 'No MIDI devices found. Plug one in.';
+        // Devices come and go; the list should not go stale in front of you.
+        onMidiPortChange(() => {
+            const chosen = select.value;
+            listMidiInputs().then((current) => {
+                select.innerHTML = '<option value="">(none)</option>';
+                for (const input of current) {
+                    const option = document.createElement('option');
+                    option.value = input.id;
+                    option.textContent = input.name;
+                    option.selected = input.id === chosen;
+                    select.appendChild(option);
+                }
+            });
+        });
+    } catch (err) {
+        if (status) status.textContent = `MIDI unavailable: ${err.message}`;
+    }
+}
+
+/**
+ * Point a card at a device and a channel. Several cards may hold the same
+ * keyboard on different channels — that is how a groovebox's tracks become
+ * separate parts, each with its own sound, from one player.
+ */
+function rebindMidiCard(instanceId) {
+    const instance = findInstance(instanceId);
+    if (!instance || instance.config.type !== 'midi') return;
+    // The device is session state, not layout: its id means nothing on another
+    // machine, so it lives on the instance and stays out of saved presets. The
+    // channel is a musical decision about which part this card plays, so it
+    // belongs in the layout and is saved with it.
+    const inputId = instance._midiDevice ?? '';
+    if (!inputId) {
+        unbindMidiCard(instanceId);
+        return;
+    }
+    const channel = Number(instance.config.parameters?.channel ?? 0);
+    // A card's part is its channel, so the track you played on is the track it
+    // arrives as. Channel 0 — the whole device — is part 0.
+    const part = cardPart(instance);
+    bindMidiCard(instanceId, inputId, channel, (midiNote, velocity) => {
+        const player = instance.config.parameters?.player?.trim();
+        // Fire and forget: the note is not heard when it is sent, it is heard
+        // when it comes back, so there is nothing to wait for here.
+        sendNote(midiNote, velocity, player, voiceForNextNote(instance), part).then(refreshMidiStatus);
+    });
+}
+
+function handleMidiDeviceChange(instanceId, inputId) {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    instance._midiDevice = inputId;
+    rebindMidiCard(instanceId);
+}
+
+function handleMidiChannelChange(instanceId, channel) {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    if (!instance.config.parameters) instance.config.parameters = {};
+    instance.config.parameters.channel = Number(channel) || 0;
+    rebindMidiCard(instanceId);
+}
+
+/** Which part a card plays. Channel 0 — the whole device — is part 0. */
+function cardPart(instance) {
+    const channel = Number(instance.config?.parameters?.channel ?? 0);
+    return channel === 0 ? 0 : (channel - 1) % PARTS;
+}
+
+// "all" takes the whole keyboard, which is what one player with one keyboard
+// wants. A numbered channel takes one track of a device that sends several, and
+// becomes the part that track arrives as.
+function midiChannelOptions(selected) {
+    const options = [`<option value="0"${Number(selected) === 0 ? ' selected' : ''}>all</option>`];
+    for (let channel = 1; channel <= PARTS; channel++) {
+        options.push(`<option value="${channel}"${Number(selected) === channel ? ' selected' : ''}>${channel}</option>`);
+    }
+    return options.join('');
+}
+
+// What sits under an address field: the account a name turned out to mean. A
+// field that stamps an identity onto transactions should never leave you
+// guessing which account it settled on.
+function describeResolved(address, name) {
+    if (!address || !name) return '';
+    return `${ellipseAddress(address, 5)}`;
+}
+
+async function handleMidiAddressChange(instanceId, key, value) {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    if (!instance.config.parameters) instance.config.parameters = {};
+    const params = instance.config.parameters;
+    const typed = value.trim();
+    const input = document.getElementById(`${instanceId}-midi-${key}`);
+    const resolvedEl = document.getElementById(`${instanceId}-midi-${key}-resolved`);
+    // A resolved address is a confirmation, not a readout: it answers "which
+    // account did that name mean" once and then costs height forever. Successes
+    // clear themselves; a failure stays, because it is still true.
+    const setNote = (text, bad = false) => {
+        if (!resolvedEl) return;
+        clearTimeout(resolvedEl._clearTimer);
+        resolvedEl.textContent = text;
+        resolvedEl.classList.toggle('resolve-failed', bad);
+        if (text && !bad) {
+            resolvedEl._clearTimer = setTimeout(() => { resolvedEl.textContent = ''; }, 4000);
+        }
+    };
+
+    if (typed === '') {
+        params[key] = '';
+        params[`${key}Name`] = '';
+        input?.classList.remove('invalid-address');
+        setNote('');
+        return;
+    }
+
+    if (looksLikeNfd(typed)) {
+        input?.classList.remove('invalid-address');
+        setNote('looking up…');
+        try {
+            const { name, address } = await resolveNfd(typed);
+            params[key] = address;
+            params[`${key}Name`] = name;
+            // The name is what you typed and what you want to keep seeing; the
+            // address is what actually goes on the transaction, so show both.
+            if (input) {
+                input.value = name;
+                input.title = address;
+            }
+            setNote(describeResolved(address, name));
+        } catch (err) {
+            // A name that resolves to nothing must not quietly leave the last
+            // address in place, or you carry on playing as someone else.
+            params[key] = '';
+            params[`${key}Name`] = '';
+            input?.classList.add('invalid-address');
+            setNote(String(err?.message ?? err).replace(/^Error:\s*/, ''), true);
+        }
+        return;
+    }
+
+    // A plain address. Flagged on the spot rather than at the first keypress,
+    // when the note has already gone somewhere unintended.
+    params[key] = typed;
+    params[`${key}Name`] = '';
+    if (input) input.title = '';
+    setNote('');
+    if (input) input.classList.toggle('invalid-address', !isValidPlayer(typed));
+}
+
+const handleContainerClick = (e) => {
+    const target = e.target;
+    // Find the closest parent synth element to get the instance ID
+    const synthElement = target.closest('.mini-synth');
+    if (!synthElement) return;
+    const instanceId = synthElement.dataset.instanceId;
+    if (!instanceId) return; // Should not happen if structure is correct
+
+    // Determine which control was clicked and call the appropriate logic function
+    if (target.matches('.led')) {
+        testFireSynth(instanceId); // audition without waiting for a matching tx
+    } else if (target.matches('.engine-btn')) {
+        handleEngineChangeLogic(instanceId, target.dataset.engine, synthElement);
+    } else if (target.matches('.tab-btn')) {
+        handleTabChangeLogic(instanceId, target.dataset.tab, synthElement);
+    } else if (target.matches('.mute-btn') || target.closest('.mute-btn')) { // Handle clicks on SVG inside button
+        handleMuteLogic(instanceId, synthElement.querySelector('.mute-btn')); // Pass button itself
+    } else if (target.matches('.close-btn')) {
+        handleCloseLogic(instanceId, synthElement);
+    } else if (target.matches('.base-note-down')) {
+        handleBaseNoteChangeLogic(instanceId, -1);
+    } else if (target.matches('.base-note-up')) {
+        handleBaseNoteChangeLogic(instanceId, 1);
+    } else if (target.matches('.octave-down')) {
+        handleOctaveChangeLogic(instanceId, -1);
+    } else if (target.matches('.octave-up')) {
+        handleOctaveChangeLogic(instanceId, 1);
+    } else if (target.matches('.midi-status')) {
+        copyEscrowAddress(target);
+    } else if (target.matches('.keyreg-toggle')) {
+        handleKeyregToggleLogic(instanceId, target);
+    }
+};
+
+const handleContainerChange = (e) => {
+    const target = e.target;
+    const instanceId = target.dataset.instanceId; // Controls should have data-instance-id
+    if (!instanceId) return; // Not a control we manage this way
+
+    if (target.matches('.type-select')) {
+        handleTypeChangeLogic(instanceId, target.value, target);
+    } else if (target.matches('.subtype-select')) {
+        handleSubtypeChangeLogic(instanceId, target.value, target);
+    } else if (target.matches('.waveform-select')) {
+        handleWaveformChangeLogic(instanceId, target.value);
+    } else if (target.matches('.seq-input')) {
+        const index = parseInt(target.dataset.seqIndex, 10);
+        handleSequenceChangeLogic(instanceId, index, target.value, target);
+    } else if (target.matches('.param-input')) {
+        handleParameterChangeLogic(instanceId, target);
+    } else if (target.matches('.lfo-waveform-select')) { // <<< ADDED >>>
+        handleLfoWaveformChangeLogic(instanceId, target.value);
+    } else if (target.matches('.lfo-destination-select')) { // <<< ADDED >>>
+        handleLfoDestinationChangeLogic(instanceId, target.value);
+    } else if (target.matches('.value-input')) {
+        handleTypedValue(instanceId, target);
+    } else if (target.matches('.midi-device-select')) {
+        handleMidiDeviceChange(instanceId, target.value);
+    } else if (target.matches('.midi-channel-select')) {
+        handleMidiChannelChange(instanceId, target.value);
+    } else if (target.matches('.midi-player-input')) {
+        handleMidiAddressChange(instanceId, 'player', target.value);
+    }
+};
+
+// Enter commits an editable value display (blur fires the change event)
+const handleContainerKeydown = (e) => {
+    if (e.key === 'Enter' && e.target.matches?.('.value-input')) e.target.blur();
+};
+
+const handleContainerInput = (e) => {
+    // Handles real-time updates for range sliders
+    const target = e.target;
+    if (target.type !== 'range') return;
+    const instanceId = target.dataset.instanceId;
+    if (!instanceId) return;
+
+    // Identify the control based on its ID structure
+    const idParts = target.id.split('-'); // e.g., [synth123, volume]
+    // Correctly identify control type even with multiple hyphens
+    const controlIdentifier = target.id.replace(`${instanceId}-`, ''); // e.g., volume, lfo-rate
+
+    // <<< Handle Master controls separately >>>
+    if (instanceId === 'master') {
+        switch(controlIdentifier) {
+            case 'volume':
+                const masterVol = parseFloat(target.value);
+                updateMasterVolume(masterVol);
+                document.getElementById(`${instanceId}-volume-value`).textContent = `${masterVol.toFixed(1)} dB`;
+                break;
+            case 'comp-thresh': {
+                const compThresh = parseFloat(target.value);
+                const ratioEl = document.getElementById(`${instanceId}-comp-ratio`);
+                updateMasterCompressor(compThresh, parseFloat(ratioEl?.value ?? '4'));
+                document.getElementById(`${instanceId}-comp-thresh-val`).textContent = `${compThresh.toFixed(0)} dB`;
+                break;
+            }
+            case 'comp-ratio': {
+                const compRatio = parseFloat(target.value);
+                const threshEl = document.getElementById(`${instanceId}-comp-thresh`);
+                updateMasterCompressor(parseFloat(threshEl?.value ?? '-24'), compRatio);
+                document.getElementById(`${instanceId}-comp-ratio-val`).textContent = `${compRatio.toFixed(0)}:1`;
+                break;
+            }
+            case 'eq-low':
+            case 'eq-mid':
+            case 'eq-high': {
+                const low = parseFloat(document.getElementById(`${instanceId}-eq-low`)?.value ?? '0');
+                const mid = parseFloat(document.getElementById(`${instanceId}-eq-mid`)?.value ?? '0');
+                const high = parseFloat(document.getElementById(`${instanceId}-eq-high`)?.value ?? '0');
+                updateMasterEQ(low, mid, high);
+                const band = controlIdentifier.split('-')[1];
+                const changed = { low, mid, high }[band];
+                document.getElementById(`${instanceId}-${controlIdentifier}-val`).textContent = `${changed.toFixed(0)} dB`;
+                break;
+            }
+            case 'limit-thresh': {
+                const limitThresh = parseFloat(target.value);
+                updateMasterLimiter(limitThresh);
+                document.getElementById(`${instanceId}-limit-thresh-val`).textContent = `${limitThresh.toFixed(1)} dB`;
+                break;
+            }
+        }
+        return; // Stop further processing for master controls
+    }
+
+    switch(controlIdentifier) {
+        case 'volume':
+            handleVolumeChangeLogic(instanceId, target.value, target);
+            break;
+        case 'attack':
+        case 'decay':
+        case 'sustain':
+        case 'release':
+             const param = target.dataset.param; // For envelope parts
+             if (param) {
+                 // A/D/R sliders are log positions 0-100; sustain is direct
+                 const real = param === 'sustain'
+                     ? target.value
+                     : sliderToTime(parseFloat(target.value), TIME_RANGES[param]);
+                 handleEnvelopeChangeLogic(instanceId, param, real);
+             }
+             // Check if it's reverb decay specifically
+             else if (target.id.includes('-reverb-decay')) {
+                 handleReverbDecayChangeLogic(instanceId, target.value, target);
+             }
+             break;
+        case 'detune':
+            handleDetuneChangeLogic(instanceId, target.value);
+            break;
+        case 'harmonicity':
+            handleHarmonicityChangeLogic(instanceId, target.value);
+            break;
+        case 'modindex':
+            handleModulationIndexChangeLogic(instanceId, target.value);
+            break;
+        case 'fenv-attack':
+        case 'fenv-decay':
+        case 'fenv-sustain':
+        case 'fenv-release': {
+            const fp = controlIdentifier.replace('fenv-', '');
+            const freal = fp === 'sustain'
+                ? target.value
+                : sliderToTime(parseFloat(target.value), TIME_RANGES[fp]);
+            handleFilterEnvelopeChangeLogic(instanceId, fp, freal);
+            break;
+        }
+        case 'note-duration': // Changed from 'duration' to match ID
+             handleNoteDurationChangeLogic(instanceId, sliderToTime(parseFloat(target.value), TIME_RANGES.duration));
+             break;
+        case 'pan':
+            handlePanChangeLogic(instanceId, target.value);
+            break;
+        case 'filter-cutoff':
+            handleFilterCutoffChangeLogic(instanceId, target.value);
+            break;
+        case 'delay-time': // Changed from 'time'
+             handleDelayTimeChangeLogic(instanceId, target.value, target);
+             break;
+        case 'delay-feedback': // Changed from 'feedback'
+             handleDelayFeedbackChangeLogic(instanceId, target.value, target);
+             break;
+        case 'delay-wet': // Changed from 'wet'
+             handleDelayWetChangeLogic(instanceId, target.value, target);
+             break;
+        case 'reverb-size':
+             handleReverbSizeChangeLogic(instanceId, target.value, target);
+             break;
+        case 'reverb-wet': // Changed from 'wet'
+             handleReverbWetChangeLogic(instanceId, target.value, target);
+             break;
+
+        // <<< LFO Controls >>>
+        case 'lfo-rate':
+            handleLfoRateChangeLogic(instanceId, sliderToTime(parseFloat(target.value), TIME_RANGES.lfoRate));
+            break;
+        case 'lfo-depth':
+            handleLfoDepthChangeLogic(instanceId, target.value, target);
+            break;
+        default:
+             // console.log("Unhandled range input:", target.id, controlIdentifier);
+             break;
+    }
+};
+
+// --- Logic Functions (Separated from direct event handling) ---
+
+function findInstance(instanceId) {
+    const instance = activeSynths.find(s => s.id === instanceId);
+    if (!instance && instanceId !== 'master') {
+        console.warn(`Could not find synth instance ${instanceId}`);
+    }
+    return instance;
+}
+
+const handleMuteLogic = (instanceId, buttonElement) => {
+    // <<< Master Mute Logic using synthesis module >>>
+    if (instanceId === 'master') {
+        // Use synthesis module for master mute functionality
+        const newMuteState = toggleMasterMute(activeSynths);
+        buttonElement.innerHTML = newMuteState ? svgIconMuted : svgIconUnmuted;
+
+        // Update UI buttons for all synths based on their current state
+        updateAllSynthMuteButtons();
+
+        return;
+    }
+
+    // <<< Individual synth mute logic >>>
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+
+    // Handle different scenarios based on current state
+    if (isMasterMuted && instance.settings.mutedByMaster) {
+        // Case: Master is muted, and this synth was muted by master
+        // Action: Unmute this synth (override master mute for this synth)
+        instance.settings.mutedByMaster = false;
+        unmuteSynthVolume(instance);
+        console.log(`Instance ${instanceId} unmuted (override master mute)`);
+    } else if (isMasterMuted && !instance.settings.mutedByMaster && !instance.settings.muted) {
+        // Case: Master is muted, but this synth was manually unmuted
+        // Action: Re-mute this synth by master
+        instance.settings.mutedByMaster = true;
+        muteSynthVolume(instance);
+        console.log(`Instance ${instanceId} re-muted by master`);
+    } else {
+        // Case: Normal user mute/unmute (master not engaged or synth has individual mute)
+        instance.settings.muted = !instance.settings.muted;
+        console.log(`Instance ${instanceId} user mute toggled to: ${instance.settings.muted}`);
+
+        // Update Tone object for user mute/unmute
+        if (!instance.settings.muted && !instance.settings.mutedByMaster && instance.toneObjects?.synth?.volume) {
+            instance.toneObjects.synth.volume.rampTo(instance.settings.volume, 0.02); // Short ramp
+        }
+    }
+
+    // Update button icon based on current state
+    updateSynthMuteButton(instanceId, instance);
+};
+
+const handleCloseLogic = (instanceId, synthElement) => {
+    const index = activeSynths.findIndex(s => s.id === instanceId);
+    if (index > -1) {
+        console.log(`Removing synth instance ${instanceId}`);
+
+        // Handle UI-specific cleanup first
+        stopStateProofCountdown(instanceId);
+        // A closed card must not keep a keyboard bound, or notes carry on
+        // going out to an instrument that is no longer on screen.
+        const wasMidi = activeSynths[index].config.type === 'midi';
+        if (wasMidi) unbindMidiCard(instanceId);
+        // Then dispose synthesis objects
+        disposeSynth(instanceId, activeSynths);
+        activeSynths.splice(index, 1);
+        synthElement.remove();
+        if (wasMidi) stopEscrowWatchIfUnwatched();
+        console.log("Active synths after close:", activeSynths);
+    } else {
+        console.warn(`Could not find synth instance ${instanceId} to remove.`);
+    }
+};
+
+const handleTypeChangeLogic = (instanceId, selectedType, selectElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+
+    const oldType = instance.config.type;
+    const synthElement = document.querySelector(`.mini-synth[data-instance-id="${instanceId}"]`);
+
+    console.log(`Type changed for ${instanceId} from ${oldType} to ${selectedType}`);
+    instance.config.type = selectedType || null;
+    instance.config.subtype = null; // Reset subtype
+    instance.config.parameters = {}; // Reset parameters
+
+    // CRITICAL FIX: Special case for stpf - auto-set subtype
+    if (selectedType === 'stpf') {
+        instance.config.subtype = 'stpf';
+    }
+
+    // Update CSS class on the synth element
+    if (synthElement) {
+        if (oldType) {
+            synthElement.classList.remove(`synth-${oldType}`);
+        }
+        if (instance.config.type) {
+            synthElement.classList.add(`synth-${instance.config.type}`);
+        }
+    }
+
+    updateSubtypeDropdown(instanceId, selectedType);
+    renderParameterArea(instanceId, selectedType, instance.config.subtype); // Pass correct subtype
+};
+
+const handleSubtypeChangeLogic = (instanceId, selectedSubtype, selectElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance || !instance.config.type) return;
+
+    console.log(`Subtype changed for ${instanceId} to ${selectedSubtype}`);
+    instance.config.subtype = selectedSubtype || null;
+    instance.config.parameters = {}; // Reset parameters on subtype change
+
+    renderParameterArea(instanceId, instance.config.type, selectedSubtype); // Re-render param area
+};
+
+const handleWaveformChangeLogic = (instanceId, waveform) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    instance.settings.oscillator.type = waveform;
+    console.log(`Instance ${instanceId} waveform changed to: ${waveform}`);
+    // PolySynth: push oscillator options to all voices
+    const oscOpts = waveform.startsWith('fat') ? { type: waveform, count: 3, spread: 20 } : { type: waveform };
+    instance.toneObjects?.synth?.set({ oscillator: oscOpts });
+};
+
+const handleSequenceChangeLogic = (instanceId, index, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance || index === undefined || index < 0 || index > 7) return;
+
+    const value = parseInt(valueStr, 10);
+    // Default to 0 if invalid, then clamp
+    const clampedValue = isNaN(value) ? 0 : Math.max(-24, Math.min(24, value));
+
+    // Update UI only if the parsed/clamped value is different from input's current value
+    if (inputElement && parseInt(inputElement.value, 10) !== clampedValue) {
+        console.log(`Clamping sequence input ${index} for ${instanceId} from ${valueStr} to ${clampedValue}`);
+        inputElement.value = clampedValue;
+    }
+
+    // Update state only if the value actually changed
+    if (instance.settings.sequence[index] !== clampedValue) {
+        instance.settings.sequence[index] = clampedValue;
+        console.log(`Instance ${instanceId} sequence[${index}] updated to: ${clampedValue}`);
+    }
+};
+
+// --- Parameter Area Logic ---
+const handleParameterChangeLogic = (instanceId, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance || !instance.config.type || !instance.config.subtype) return;
+
+    const paramType = inputElement.dataset.paramType;
+    let value = inputElement.value.trim();
+
+    if (inputElement.type === 'number') {
+        // Allow empty string to represent null/cleared value for optional numbers
+        value = value === '' ? null : parseFloat(value);
+        // Basic validation for number types
+        if (value !== null && isNaN(value)) {
+            console.warn(`Invalid number input for ${paramType} on ${instanceId}: ${inputElement.value}`);
+            // Optional: reset UI or prevent update? For now, allow NaN to be stored briefly.
+            value = null; // Or revert to previous? For simplicity, set null
+        }
+    }
+
+    if (!paramType) {
+        console.warn("Missing data-param-type on parameter input:", inputElement);
+        return;
+    }
+
+    console.log(`Param ${paramType} for ${instanceId} (${instance.config.subtype}) changed to:`, value);
+    instance.config.parameters[paramType] = value;
+};
+
+const handleKeyregToggleLogic = (instanceId, buttonElement) => {
+    const instance = findInstance(instanceId);
+     if (!instance || instance.config.type !== 'keyreg') return;
+
+     // Determine current state (online/offline) - could be stored or inferred
+     const currentState = instance.config.subtype || 'online'; // Default to online?
+     const newState = currentState === 'online' ? 'offline' : 'online';
+
+     console.log(`Toggling Keyreg for ${instanceId} from ${currentState} to ${newState}`);
+
+     // Update instance state
+     instance.config.subtype = newState;
+     // Update parameters if needed (e.g., set a boolean parameter)
+     instance.config.parameters['state'] = newState; // Example parameter
+
+     // Update button appearance/text
+     buttonElement.textContent = `Set ${newState === 'online' ? 'Offline' : 'Online'}`;
+     buttonElement.dataset.state = newState;
+
+     // Update the main subtype dropdown to reflect the change
+     const subtypeSelect = document.querySelector(`.subtype-select[data-instance-id="${instanceId}"]`);
+     if (subtypeSelect) {
+         subtypeSelect.value = newState;
+     }
+ };
+
+// Typed values from the editable value displays: parse the unit-bearing
+// text, clamp to the control's real range, route through the same logic
+// as the sliders, and move the slider to match. Successful cases return;
+// falling out of the switch means the text didn't parse, and the field is
+// restored from settings so garbage never sticks.
+const handleTypedValue = (instanceId, inputEl) => {
+    const ctrl = inputEl.dataset.vctrl;
+    const raw = inputEl.value.trim();
+    const num = parseFloat(raw.replace(',', '.'));
+    const setSlider = (suffix, v) => {
+        const s = document.getElementById(`${instanceId}-${suffix}`);
+        if (s) s.value = v;
+    };
+    const clamped = (lo, hi) => Math.max(lo, Math.min(hi, num));
+
+    switch (ctrl) {
+        case 'volume':
+            if (!Number.isFinite(num)) break;
+            handleVolumeChangeLogic(instanceId, String(clamped(-60, 3)));
+            setSlider('volume', clamped(-60, 3));
+            return;
+        case 'pan': {
+            let v; // accepts -100..100, "25L", "25R", "C"
+            const m = raw.match(/^(\d+(?:\.\d+)?)\s*([LlRr])$/);
+            if (m) v = (m[2].toLowerCase() === 'l' ? -1 : 1) * parseFloat(m[1]);
+            else if (/^c$/i.test(raw)) v = 0;
+            else v = num;
+            if (!Number.isFinite(v)) break;
+            v = Math.max(-100, Math.min(100, Math.round(v)));
+            handlePanChangeLogic(instanceId, String(v));
+            setSlider('pan', v);
+            return;
+        }
+        case 'cutoff': {
+            let hz = /k/i.test(raw) ? num * 1000 : num; // accepts "1200" or "1.2k"
+            if (!Number.isFinite(hz)) break;
+            hz = Math.round(Math.max(50, Math.min(20000, hz)));
+            const instance = findInstance(instanceId);
+            if (!instance) break;
+            if (!instance.settings.filter) instance.settings.filter = {};
+            instance.settings.filter.cutoff = hz;
+            inputEl.value = formatCutoff(hz);
+            instance.toneObjects?.filter?.frequency?.rampTo(hz, 0.02);
+            setSlider('filter-cutoff', cutoffToSlider(hz));
+            return;
+        }
+        case 'duration':
+            if (!Number.isFinite(num)) break;
+            handleNoteDurationChangeLogic(instanceId, num);
+            setSlider('note-duration', timeToSlider(num, TIME_RANGES.duration));
+            return;
+        case 'attack':
+        case 'decay':
+        case 'release':
+            if (!Number.isFinite(num)) break;
+            handleEnvelopeChangeLogic(instanceId, ctrl, num);
+            setSlider(ctrl, timeToSlider(num, TIME_RANGES[ctrl]));
+            return;
+        case 'sustain':
+            if (!Number.isFinite(num)) break;
+            handleEnvelopeChangeLogic(instanceId, 'sustain', num);
+            setSlider('sustain', clamped(0, 1));
+            return;
+        case 'delay-time':
+            if (!Number.isFinite(num)) break;
+            handleDelayTimeChangeLogic(instanceId, String(clamped(0, 4)));
+            setSlider('delay-time', clamped(0, 4));
+            return;
+        case 'delay-feedback':
+            if (!Number.isFinite(num)) break;
+            handleDelayFeedbackChangeLogic(instanceId, String(clamped(0, 0.95)));
+            setSlider('delay-feedback', clamped(0, 0.95));
+            return;
+        case 'delay-wet':
+            if (!Number.isFinite(num)) break;
+            handleDelayWetChangeLogic(instanceId, String(clamped(0, 1)));
+            setSlider('delay-wet', clamped(0, 1));
+            return;
+        case 'reverb-size':
+            if (!Number.isFinite(num)) break;
+            handleReverbSizeChangeLogic(instanceId, String(clamped(0, 1)));
+            setSlider('reverb-size', clamped(0, 1));
+            return;
+        case 'reverb-wet':
+            if (!Number.isFinite(num)) break;
+            handleReverbWetChangeLogic(instanceId, String(clamped(0, 1)));
+            setSlider('reverb-wet', clamped(0, 1));
+            return;
+        case 'lfo-rate':
+            if (!Number.isFinite(num)) break;
+            handleLfoRateChangeLogic(instanceId, String(num));
+            setSlider('lfo-rate', timeToSlider(num, TIME_RANGES.lfoRate));
+            return;
+        case 'lfo-depth':
+            if (!Number.isFinite(num)) break;
+            handleLfoDepthChangeLogic(instanceId, String(Math.round(clamped(0, 100))));
+            setSlider('lfo-depth', Math.round(clamped(0, 100)));
+            return;
+        case 'detune':
+            if (!Number.isFinite(num)) break;
+            handleDetuneChangeLogic(instanceId, String(clamped(-1200, 1200)));
+            setSlider('detune', clamped(-1200, 1200));
+            return;
+        case 'harmonicity':
+            if (!Number.isFinite(num)) break;
+            handleHarmonicityChangeLogic(instanceId, String(clamped(0.1, 8)));
+            setSlider('harmonicity', clamped(0.1, 8));
+            return;
+        case 'modindex':
+            if (!Number.isFinite(num)) break;
+            handleModulationIndexChangeLogic(instanceId, String(clamped(0, 100)));
+            setSlider('modindex', clamped(0, 100));
+            return;
+        case 'fenv-attack':
+        case 'fenv-decay':
+        case 'fenv-release': {
+            if (!Number.isFinite(num)) break;
+            const fp = ctrl.replace('fenv-', '');
+            handleFilterEnvelopeChangeLogic(instanceId, fp, num);
+            setSlider(`fenv-${fp}`, timeToSlider(num, TIME_RANGES[fp]));
+            return;
+        }
+        case 'fenv-sustain':
+            if (!Number.isFinite(num)) break;
+            handleFilterEnvelopeChangeLogic(instanceId, 'sustain', num);
+            setSlider('fenv-sustain', clamped(0, 1));
+            return;
+    }
+
+    // Parse failed: restore the field from current settings
+    const inst = findInstance(instanceId);
+    if (!inst) return;
+    const s = inst.settings;
+    const restore = {
+        volume: () => `${s.volume.toFixed(1)} dB`,
+        pan: () => formatPan(s.pan ?? 0),
+        cutoff: () => formatCutoff(s.filter?.cutoff ?? 20000),
+        duration: () => formatSecs(s.noteDuration),
+        attack: () => formatSecs(s.envelope.attack),
+        decay: () => formatSecs(s.envelope.decay),
+        sustain: () => s.envelope.sustain.toFixed(2),
+        release: () => formatSecs(s.envelope.release),
+        'delay-time': () => `${s.delay.time.toFixed(2)}s`,
+        'delay-feedback': () => s.delay.feedback.toFixed(2),
+        'delay-wet': () => s.delay.wet.toFixed(2),
+        'reverb-size': () => (s.reverb.roomSize ?? 0.5).toFixed(2),
+        'reverb-wet': () => s.reverb.wet.toFixed(2),
+        'lfo-rate': () => `${s.lfo.rate >= 1 ? s.lfo.rate.toFixed(1) : s.lfo.rate.toFixed(2)} Hz`,
+        'lfo-depth': () => s.lfo.depth.toFixed(0),
+        detune: () => (s.detune ?? 0).toFixed(0),
+        harmonicity: () => (s.harmonicity ?? 3).toFixed(1),
+        modindex: () => (s.modulationIndex ?? 10).toFixed(0),
+        'fenv-attack': () => formatSecs(s.filterEnvelope?.attack ?? 0.6),
+        'fenv-decay': () => formatSecs(s.filterEnvelope?.decay ?? 0.2),
+        'fenv-sustain': () => (s.filterEnvelope?.sustain ?? 0.5).toFixed(2),
+        'fenv-release': () => formatSecs(s.filterEnvelope?.release ?? 2),
+    }[ctrl];
+    if (restore) inputEl.value = restore();
+};
+
+// --- Tone.js Control Logic Functions ---
+
+const handleVolumeChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const value = parseFloat(valueStr);
+    instance.settings.volume = value;
+    const display = document.getElementById(`${instanceId}-volume-value`);
+    if (display) display.value = `${value.toFixed(1)} dB`;
+    // Update Tone object (only if not muted)
+    if (!instance.settings.muted && instance.toneObjects?.synth?.volume) {
+        instance.toneObjects.synth.volume.rampTo(value, 0.02); // Short ramp
+    }
+};
+
+const handlePanChangeLogic = (instanceId, valueStr) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const pan = Math.max(-1, Math.min(1, parseInt(valueStr, 10) / 100));
+    instance.settings.pan = pan;
+    const display = document.getElementById(`${instanceId}-pan-value`);
+    if (display) display.value = formatPan(pan);
+    instance.toneObjects?.panner?.pan?.rampTo(pan, 0.02);
+};
+
+const handleFilterCutoffChangeLogic = (instanceId, valueStr) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const cutoff = sliderToCutoff(parseInt(valueStr, 10));
+    if (!instance.settings.filter) instance.settings.filter = {};
+    instance.settings.filter.cutoff = cutoff;
+    const display = document.getElementById(`${instanceId}-filter-cutoff-value`);
+    if (display) display.value = formatCutoff(cutoff);
+    instance.toneObjects?.filter?.frequency?.rampTo(cutoff, 0.02);
+};
+
+// Takes REAL values (seconds for A/D/R, level 0-1 for S) — slider events
+// convert from log positions before calling. PolySynth has no .envelope,
+// so the live update goes through synth.set (applies to every voice); the
+// same click floors used at creation apply here.
+const handleEnvelopeChangeLogic = (instanceId, param, realValue) => {
+    const instance = findInstance(instanceId);
+    if (!instance || !param) return;
+    let value = parseFloat(realValue);
+    if (!Number.isFinite(value)) return;
+    if (param === 'attack') value = Math.max(0.005, Math.min(10, value));
+    if (param === 'decay') value = Math.max(0.001, Math.min(10, value));
+    if (param === 'sustain') value = Math.max(0, Math.min(1, value));
+    if (param === 'release') value = Math.max(0.03, Math.min(10, value));
+    instance.settings.envelope[param] = value;
+    const display = document.getElementById(`${instanceId}-${param}-value`);
+    if (display) display.value = param === 'sustain' ? value.toFixed(2) : formatSecs(value);
+    instance.toneObjects?.synth?.set({ envelope: { [param]: value } });
+};
+
+const handleNoteDurationChangeLogic = (instanceId, realSeconds) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    let value = parseFloat(realSeconds);
+    if (!Number.isFinite(value)) return;
+    value = Math.max(0.01, Math.min(20, value));
+    instance.settings.noteDuration = value;
+    const display = document.getElementById(`${instanceId}-note-duration-value`);
+    if (display) display.value = formatSecs(value);
+    // NoteDuration is used in playTransactionSound, no direct Tone object update here
+};
+
+// Detune is universal — every Tone engine has it — so this handler is
+// engine-agnostic. It isn't a constructor option on any engine's type
+// (it's a runtime Signal instead), so it's applied via .set() same as
+// PolySynth's own docs show.
+const handleDetuneChangeLogic = (instanceId, valueStr) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    let value = parseFloat(valueStr);
+    if (!Number.isFinite(value)) return;
+    value = Math.max(-1200, Math.min(1200, value));
+    instance.settings.detune = value;
+    const display = document.getElementById(`${instanceId}-detune-value`);
+    if (display) display.value = value.toFixed(0);
+    instance.toneObjects?.synth?.set({ detune: value });
+};
+
+const handleHarmonicityChangeLogic = (instanceId, valueStr) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    let value = parseFloat(valueStr);
+    if (!Number.isFinite(value)) return;
+    value = Math.max(0.1, Math.min(8, value));
+    instance.settings.harmonicity = value;
+    const display = document.getElementById(`${instanceId}-harmonicity-value`);
+    if (display) display.value = value.toFixed(1);
+    instance.toneObjects?.synth?.set({ harmonicity: value });
+};
+
+const handleModulationIndexChangeLogic = (instanceId, valueStr) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    let value = parseFloat(valueStr);
+    if (!Number.isFinite(value)) return;
+    value = Math.max(0, Math.min(100, value));
+    instance.settings.modulationIndex = value;
+    const display = document.getElementById(`${instanceId}-modindex-value`);
+    if (display) display.value = value.toFixed(0);
+    instance.toneObjects?.synth?.set({ modulationIndex: value });
+};
+
+// MonoSynth's own filter envelope — same ADSR shape as the amp envelope,
+// aimed at brightness instead of loudness.
+const handleFilterEnvelopeChangeLogic = (instanceId, param, realValue) => {
+    const instance = findInstance(instanceId);
+    if (!instance || !param) return;
+    let value = parseFloat(realValue);
+    if (!Number.isFinite(value)) return;
+    if (param === 'attack') value = Math.max(0.001, Math.min(10, value));
+    if (param === 'decay') value = Math.max(0.001, Math.min(10, value));
+    if (param === 'sustain') value = Math.max(0, Math.min(1, value));
+    if (param === 'release') value = Math.max(0.005, Math.min(10, value));
+    if (!instance.settings.filterEnvelope) instance.settings.filterEnvelope = {};
+    instance.settings.filterEnvelope[param] = value;
+    const display = document.getElementById(`${instanceId}-fenv-${param}-value`);
+    if (display) display.value = param === 'sustain' ? value.toFixed(2) : formatSecs(value);
+    instance.toneObjects?.synth?.set({ filterEnvelope: { [param]: value } });
+};
+
+const handleDelayTimeChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const value = parseFloat(valueStr);
+    instance.settings.delay.time = value;
+    const display = document.getElementById(`${instanceId}-delay-time-value`);
+    if (display) display.value = `${value.toFixed(2)}s`;
+    // Update Tone object
+    instance.toneObjects?.delay?.delayTime?.rampTo(value, 0.02);
+};
+
+const handleDelayFeedbackChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const value = parseFloat(valueStr);
+    instance.settings.delay.feedback = value;
+    const display = document.getElementById(`${instanceId}-delay-feedback-value`);
+    if (display) display.value = value.toFixed(2);
+    // Update Tone object
+    instance.toneObjects?.delay?.feedback?.rampTo(value, 0.02);
+};
+
+const handleDelayWetChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const value = parseFloat(valueStr);
+    instance.settings.delay.wet = value;
+    const display = document.getElementById(`${instanceId}-delay-wet-value`);
+    if (display) display.value = value.toFixed(2);
+    // Update Tone object
+    instance.toneObjects?.delay?.wet?.rampTo(value, 0.02);
+    if (instance.toneObjects) rewireFxChain(instance.toneObjects, instance.settings);
+};
+
+const handleReverbDecayChangeLogic = (instanceId, valueStr, inputElement) => {
+    // Back-compat: map old decay (in seconds) to Freeverb roomSize (0-1)
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const decaySeconds = parseFloat(valueStr);
+    const roomSize = Math.max(0, Math.min(1, decaySeconds / 10));
+    instance.settings.reverb.roomSize = roomSize;
+    const display = document.getElementById(`${instanceId}-reverb-size-value`);
+    if (display) display.value = roomSize.toFixed(2);
+    updateSharedReverbRoomSize(roomSize); // room is global (shared bus)
+};
+
+const handleReverbSizeChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const value = Math.max(0, Math.min(1, parseFloat(valueStr)));
+    instance.settings.reverb.roomSize = value;
+    const display = document.getElementById(`${instanceId}-reverb-size-value`);
+    if (display) display.value = value.toFixed(2);
+    updateSharedReverbRoomSize(value); // room is global (shared bus)
+};
+
+const handleReverbWetChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const value = parseFloat(valueStr);
+    instance.settings.reverb.wet = value;
+    const display = document.getElementById(`${instanceId}-reverb-wet-value`);
+    if (display) display.value = value.toFixed(2);
+    // Wet = send amount into the shared reverb bus
+    instance.toneObjects?.reverbSend?.gain?.rampTo(value, 0.02);
+    if (instance.toneObjects) rewireFxChain(instance.toneObjects, instance.settings);
+};
+
+// --- Base Note / Octave Logic ---
+const handleBaseNoteChangeLogic = (instanceId, direction) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+
+    const currentNoteWithOctave = instance.settings.baseNote;
+    let noteName = '';
+    let octave = defaultOctave;
+    const match = currentNoteWithOctave.match(/^([A-G]#?)([0-9])$/);
+    if (match) {
+        noteName = match[1];
+        octave = parseInt(match[2], 10);
+    } else {
+        console.error(`Cannot parse base note: ${currentNoteWithOctave}`);
+        return;
+    }
+
+    let currentIndex = chromaticScale.indexOf(noteName);
+    if (currentIndex === -1) {
+         console.error(`Cannot find note ${noteName} in scale`);
+        return;
+    }
+
+    let newIndex = (currentIndex + direction + chromaticScale.length) % chromaticScale.length;
+    const newNoteName = chromaticScale[newIndex];
+    const newBaseNote = `${newNoteName}${octave}`;
+
+    instance.settings.baseNote = newBaseNote;
+    const displayEl = document.getElementById(`${instanceId}-base-note-display`);
+    if (displayEl) displayEl.textContent = newBaseNote;
+    // console.log(`Instance ${instanceId} base note changed to: ${newBaseNote}`);
+
+    // <<< Update LFO if targeting pitch >>>
+    if (instance.settings.lfo.destination === 'pitch') {
+        connectLFO(instance);
+    }
+};
+
+const handleOctaveChangeLogic = (instanceId, direction) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+
+    const currentNoteWithOctave = instance.settings.baseNote;
+    const minOctave = 0;
+    const maxOctave = 8;
+    const match = currentNoteWithOctave.match(/^([A-G]#?)([0-9])$/);
+    if (match) {
+        const noteName = match[1];
+        let octave = parseInt(match[2], 10);
+        let newOctave = octave + direction;
+        newOctave = Math.max(minOctave, Math.min(maxOctave, newOctave));
+        if (newOctave !== octave) {
+            const newBaseNote = `${noteName}${newOctave}`;
+            instance.settings.baseNote = newBaseNote;
+            const displayEl = document.getElementById(`${instanceId}-base-note-display`);
+            if (displayEl) displayEl.textContent = newBaseNote;
+            // console.log(`Instance ${instanceId} octave changed to: ${newOctave}`);
+
+            // <<< Update LFO if targeting pitch >>>
+            if (instance.settings.lfo.destination === 'pitch') {
+                connectLFO(instance);
+            }
+        }
+    } else {
+         console.error(`Cannot parse base note for octave change: ${currentNoteWithOctave}`);
+    }
+};
+
+// --- Helpers for Dynamic UI ---
+
+// updateSubtypeDropdown - Needs slight adaptation to use instanceId
+function updateSubtypeDropdown(instanceId, selectedType) {
+    const subtypeSelect = document.querySelector(`.subtype-select[data-instance-id="${instanceId}"]`);
+    if (!subtypeSelect) return;
+    subtypeSelect.innerHTML = '<option value="">Sub</option>'; // Clear existing
+    if (selectedType && granularityRules[selectedType]) {
+        granularityRules[selectedType].forEach(rule => {
+            const option = document.createElement('option');
+            option.value = rule.subtype;
+            option.textContent = rule.subtype;
+            subtypeSelect.appendChild(option);
+        });
+    }
+}
+
+// <<< renderParameterArea handles keyreg toggle better AND adds Label >>>
+function renderParameterArea(instanceId, type, subtype) {
+    const paramArea = document.getElementById(`params-${instanceId}`);
+    if (!paramArea) return;
+    paramArea.innerHTML = ''; // Clear existing
+    const instance = findInstance(instanceId); // Needed for current values
+    if (!instance) return;
+
+    let paramHTML = ''; // Start with empty HTML
+
+    // <<< UPDATED: Special handling for stpf type >>>
+    if (type === 'stpf') {
+        // CRITICAL FIX: Set the subtype so transaction matching works
+        instance.config.subtype = 'stpf';
+
+        // Initialize countdown display (will be populated when synth is created)
+        paramHTML += `<span id="${instanceId}-stpf-countdown" class="countdown-value">...</span>`;
+
+        paramArea.innerHTML = paramHTML;
+
+        // Initialize the countdown asynchronously
+        initializeStateProofCountdown(instanceId);
+        return;
+    }
+
+    // The MIDI card: a device to play from, a name to play under, and a choice
+    // of whose playing to sound. No transaction filter, because the only thing
+    // it ever listens for is a note.
+    if (type === 'midi') {
+        const params = instance.config.parameters ?? {};
+        // Device and channel live in the header, where they cost no height. A
+        // card's height is the most expensive thing in a layout.
+        paramHTML += `
+            <div class="param-control">
+                <label class="midi-play-as" for="${instanceId}-midi-player">Play as:</label>
+                <input type="text" id="${instanceId}-midi-player" class="midi-player-input text-input" placeholder="address or name.algo" value="${params.playerName || params.player || ''}" data-instance-id="${instanceId}" title="Stamped on every note you send, so others can pick your playing out. Costs nothing — a zero transfer never touches the receiving account.">
+            </div>
+            <div class="midi-resolved" id="${instanceId}-midi-player-resolved"></div>
+            <div class="midi-status" id="${instanceId}-midi-status" data-instance-id="${instanceId}">reading the escrow…</div>
+        `;
+        paramArea.innerHTML = paramHTML;
+        initializeMidiCard(instanceId);
+        return;
+    }
+
+    // Special handling for block type - show current round
+    if (type === 'block') {
+        paramHTML += `<span id="${instanceId}-current-round" class="current-round-value">${currentRound > 0 ? currentRound : 'N/A'}</span>`;
+        paramArea.innerHTML = paramHTML;
+        return;
+    }
+
+    if (!type || !subtype) {
+        // If no type/subtype, just show the label input
+        paramArea.innerHTML = paramHTML; // Set the HTML containing only the label
+        return;
+    }
+
+    const rule = granularityRules[type]?.find(r => r.subtype === subtype);
+
+    if (!rule) { // Rule not found for subtype
+        // Append message to the existing paramHTML (which has the label)
+        paramHTML += '<div class="param-control"><span class="no-params">Invalid subtype selected?</span></div>';
+        paramArea.innerHTML = paramHTML;
+        return;
+    }
+
+    // --- Check if Label is needed for this subtype ---
+    const identifyingParamTypes = ['address', 'asset-id', 'app-id', 'manager-address', 'sender', 'receiver', 'aclose'];
+    const showLabelInput = rule.params && rule.params.some(p => identifyingParamTypes.includes(p));
+
+    // --- Generate Label HTML *if needed* ---
+    if (showLabelInput) {
+        const currentLabel = instance.config.parameters?.label ?? '';
+        paramHTML += `
+            <div class="param-control">
+                <label for="${instanceId}-param-label">Label:</label>
+                <input type="text" id="${instanceId}-param-label" name="label" class="param-input text-input" placeholder="(Optional Name)" data-instance-id="${instanceId}" data-param-type="label" value="${currentLabel}">
+            </div>
+        `;
+    }
+
+    // --- Generate other parameters ---
+
+    // Handle cases with no standard input parameters first
+    if (!rule.params || rule.params.length === 0) {
+         // Append message (Label was already potentially added)
+        paramHTML += '<div class="param-control"><span class="no-params">No parameters needed.</span></div>';
+        paramArea.innerHTML = paramHTML;
+        return;
+    }
+
+    // Handle specific parameter types defined in the rule
+    if (rule.params.includes('toggle')) { // Special case for keyreg online/offline
+         const currentState = instance.config.subtype || 'online';
+         const buttonText = `Set ${currentState === 'online' ? 'Offline' : 'Online'}`;
+         // Append toggle button HTML to paramHTML
+         paramHTML += `<div class="param-control">
+                            <button class="keyreg-toggle" data-instance-id="${instanceId}" data-state="${currentState}">${buttonText}</button>
+                         </div>`;
+         paramArea.innerHTML = paramHTML; // Set HTML with label + button
+         return; // Stop here for toggle type
+    }
+
+    // Generate standard input fields and append them to paramHTML
+    rule.params.forEach(param => {
+        const inputId = `${instanceId}-${subtype}-${param}`;
+        const label = param.replace(/-/g, ' ').replace(/\b\\w/g, l => l.toUpperCase());
+        const currentValue = instance.config.parameters?.[param] ?? '';
+
+        // Append the specific parameter control HTML
+        if (param === 'min' || param === 'max') {
+            paramHTML += `
+                <div class="param-control">
+                    <label for="${inputId}">${label}:</label>
+                    <input type="number" id="${inputId}" name="${param}" class="param-input number-input" data-instance-id="${instanceId}" data-param-type="${param}" value="${currentValue}">
+                </div>`;
+        } else if (param === 'asset-id') { // searchable: type a name, pick the ID
+             ensureAsaDatalist();
+             paramHTML += `
+                <div class="param-control">
+                    <label for="${inputId}">${label}:</label>
+                    <input type="text" id="${inputId}" name="${param}" class="param-input text-input" list="asa-datalist" placeholder="ID or name..." data-instance-id="${instanceId}" data-param-type="${param}" value="${currentValue}">
+                </div>`;
+        } else { // address, app-id, manager-address etc.
+             paramHTML += `
+                <div class="param-control">
+                    <label for="${inputId}">${label}:</label>
+                    <input type="text" id="${inputId}" name="${param}" class="param-input text-input" data-instance-id="${instanceId}" data-param-type="${param}" value="${currentValue}">
+                </div>`;
+        }
+    });
+    // Set the final HTML containing the label + all specific parameters
+    paramArea.innerHTML = paramHTML;
+}
+
+// Corrected injectSliderStyles function
+const injectSliderStyles = () => {
+    // This function is kept for potential future use,
+    // but the main styles for .seq-input are now in index.html
+    // We can leave the CSS string empty or add other non-conflicting styles here.
+    const css = `
+    /* Base styles for range inputs - These might still be useful here */
+    input[type='range'] {
+        -webkit-appearance: none; /* Override default look */
+        appearance: none;
+        width: 100%; /* Full width */
+        height: 5px; /* Specified height */
+        background: #003333; /* Dark track */
+      outline: none;
+        opacity: 0.9;
+        transition: opacity .15s ease-in-out;
+        border-radius: 2px;
+        margin: 3px 0; /* Add some vertical margin */
+    }
+
+    input[type='range']::-webkit-slider-thumb {
+      -webkit-appearance: none;
+        appearance: none;
+        width: 10px; /* Thumb width */
+        height: 14px; /* Thumb height */
+        background: #009999; /* Teal thumb */
+        border-radius: 2px; /* Slightly rounded */
+      cursor: pointer;
+    }
+
+    input[type='range']::-moz-range-thumb {
+        width: 10px;
+        height: 14px;
+        background: #009999;
+        border-radius: 2px;
+        cursor: pointer;
+        border: none; /* Remove default border */
+    }
+    /* Add any other styles previously injected here that AREN'T .seq-input */
+    `;
+    const style = document.createElement('style');
+    // Only add if there's content
+    if (css.trim()) {
+        style.textContent = css;
+        document.head.appendChild(style);
+    }
+};
+
+// <<< LFO Logic Functions >>>
+
+// scaleLfoDepth function moved to tone-synthesis.js
+
+// connectLFO function moved to tone-synthesis.js
+
+const handleLfoRateChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    let value = parseFloat(valueStr);
+    if (!Number.isFinite(value)) return;
+    value = Math.max(0.01, Math.min(30, value));
+    instance.settings.lfo.rate = value;
+    const display = document.getElementById(`${instanceId}-lfo-rate-value`);
+    if (display) display.value = `${value >= 1 ? value.toFixed(1) : value.toFixed(2)} Hz`;
+    // Update Tone object
+    instance.toneObjects?.lfo?.set({ frequency: value });
+    if (instance.settings.lfo.destination === 'pitch') {
+        instance.toneObjects?.vibrato?.set({ frequency: value });
+    }
+};
+
+const handleLfoDepthChangeLogic = (instanceId, valueStr, inputElement) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    const value = parseFloat(valueStr); // Depth is 0-100
+    instance.settings.lfo.depth = value;
+    const display = document.getElementById(`${instanceId}-lfo-depth-value`);
+    if (display) display.value = value.toFixed(0);
+    // Reconnect LFO to apply new depth scaling and amplitude
+    connectLFO(instance);
+};
+
+const handleLfoWaveformChangeLogic = (instanceId, waveform) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    instance.settings.lfo.waveform = waveform;
+    // Update Tone object
+    instance.toneObjects?.lfo?.set({ type: waveform });
+    if (instance.settings.lfo.destination === 'pitch') {
+        instance.toneObjects?.vibrato?.set({ type: waveform });
+    }
+};
+
+const handleLfoDestinationChangeLogic = (instanceId, destination) => {
+    const instance = findInstance(instanceId);
+    if (!instance) return;
+    instance.settings.lfo.destination = destination;
+    // Reconnect LFO to the new destination
+    connectLFO(instance);
+};
+
+// <<< Functions to manage persistent counters >>>
+function loadPersistentCounters() {
+    persistentTotalTxs = parseInt(localStorage.getItem('persistentTotalTxs') || '0', 10);
+    persistentTotalBlocks = parseInt(localStorage.getItem('persistentTotalBlocks') || '0', 10);
+    updatePersistentCountersDisplay();
+}
+
+function updatePersistentCountersDisplay() {
+    const persistentTxEl = document.getElementById('persistent-tx-count');
+    const persistentBlockEl = document.getElementById('persistent-block-count');
+    if (persistentTxEl) {
+        persistentTxEl.textContent = `Lifetime Txs: ${persistentTotalTxs.toLocaleString()}`;
+    }
+    if (persistentBlockEl) {
+        persistentBlockEl.textContent = `Lifetime Blocks: ${persistentTotalBlocks.toLocaleString()}`;
+    }
+}
+
+// <<< Now loads a named preset from Local Storage directly >>>
+const loadPresetFromLocalStorage = async (presetNameToLoad) => {
+  const presetName = presetNameToLoad;
+  if (!presetName) return;
+
+  let loadedData = null;
+  let isOldFormat = false;
+
+  const userPresets = JSON.parse(localStorage.getItem('txSynthPresets') || 'null');
+  if (userPresets && userPresets[presetName]) {
+      loadedData = userPresets[presetName];
+      isOldFormat = loadedData.settings && !loadedData.activeSynths;
+  }
+
+  if (!loadedData) {
+    alert(`Preset '${presetName}' not found in Local Storage.`);
+    return;
+  }
+
+  console.log(`Loading preset: ${presetName} (from local storage)`);
+  readPresetProvenance(loadedData, presetName);
+
+  // --- Clear Current State more surgically ---
+  console.log("Clearing current synths and UI...");
+  const regularSynths = activeSynths.filter(s => s.id !== 'master');
+  regularSynths.forEach(instance => {
+      // Handle UI-specific cleanup first
+      stopStateProofCountdown(instance.id);
+      // Then dispose synthesis objects
+      disposeSynth(instance.id, activeSynths);
+  });
+  activeSynths = activeSynths.filter(s => s.id === 'master');
+
+  const synthContainer = document.getElementById('synth-container');
+  const regularSynthElements = synthContainer.querySelectorAll('.mini-synth:not(.master-synth)');
+  regularSynthElements.forEach(el => el.remove());
+
+  // --- Process Loaded Data (Migrate if necessary) ---
+  let targetActiveSynths = [];
+  if (isOldFormat) {
+      console.warn(`Preset '${presetName}' is in old format. Migrating... Granularity will be lost.`);
+      // Attempt migration from old { settings: { pay: {...}, axfer: {...} } } structure
+      if (loadedData.settings && typeof loadedData.settings === 'object') {
+            // Use displayedSynths order if available, otherwise just iterate settings keys
+            const typesToLoad = loadedData.displayedSynths || Object.keys(loadedData.settings);
+
+            typesToLoad.forEach(type => {
+                if (loadedData.settings[type]) { // Check if settings for this type exist
+                    const oldSettings = loadedData.settings[type];
+                    const uniqueId = `synth-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+                    const newInstance = {
+                        id: uniqueId,
+                        config: { type: type, subtype: null, parameters: {} }, // Basic config
+                        settings: foldPitchIntoBaseNote({ // Merge old settings into defaults
+                             ...getDefaultInstanceSettings(), // Start with defaults
+                             ...oldSettings // Overwrite with saved values
+                        }),
+                        toneObjects: null
+                    };
+                    targetActiveSynths.push(newInstance);
+      } else {
+                     console.warn(`Type "${type}" listed in old preset but settings missing.`);
+                }
+            });
+      } else {
+          alert(`Failed to migrate old preset format for '${presetName}'. Invalid structure.`);
+          return;
+      }
+  } else if (loadedData.activeSynths && Array.isArray(loadedData.activeSynths)) {
+      // New format: Load directly
+      console.log("Loading preset in new format.");
+      // Deep copy might be safer if objects are complex, but direct assign is ok for now
+      // We need to ensure each loaded instance has default settings applied correctly if partial
+       targetActiveSynths = loadedData.activeSynths.map(loadedInstance => ({
+            ...loadedInstance, // Spread loaded data (id, config)
+            settings: { // Ensure settings are complete
+                 ...getDefaultInstanceSettings(),
+                 ...(loadedInstance.settings || {})
+            },
+            toneObjects: null // Tone objects always start as null when loading
+        }));
+  } else {
+       alert(`Preset '${presetName}' has an unrecognized format.`);
+       return;
+  }
+
+   // --- Update State and Rebuild UI ---
+  activeSynths.push(...targetActiveSynths);
+  console.log("Applied loaded/migrated settings. Active Synths:", activeSynths);
+
+  console.log("Rebuilding UI...");
+  targetActiveSynths.forEach(instance => {
+      synthContainer.innerHTML += createSynthHTML(instance);
+      // Render parameter area based on loaded config
+      renderParameterArea(instance.id, instance.config.type, instance.config.subtype);
+  });
+
+  // --- Initialize Audio for New Instances ---
+  console.log("Initializing audio objects for loaded synths...");
+  // Ensure global context is running first
+  if (!synthsInitialized) { await initAudio(); }
+  // Initialize Tone for each loaded instance
+  for (const instance of targetActiveSynths) {
+      await initializeToneForInstance(instance);
+  }
+
+  // --- Update Other UI ---
+  // initializeEventListeners(); // Delegated listeners are already attached
+  // updateAllValueDisplays(); // TODO: Implement this later
+  // updateAllSequencerDisplays(); // TODO: Implement this later
+  console.log(`Preset "${presetName}" loaded successfully.`);
+  updateStatus(`Preset "${presetName}" loaded`);
+  currentPreset = { name: presetName, source: 'local' };
+  setPresetUrl(null); // local presets live in this browser only — not linkable
+  // Optionally clear status after a delay
+  // setTimeout(() => updateStatus('Streaming...'), 2000);
+};
+
+// <<< Helper functions for master mute management >>>
+function getAllRegularSynths() {
+    return activeSynths.filter(instance => instance.id !== 'master');
+}
+
+// Helper function to determine if a synth should be visually muted
+function shouldSynthBeVisuallyMuted(instance) {
+    // A synth should show as muted if:
+    // 1. It's muted by the user, OR
+    // 2. It's muted by master mute (and master mute is active)
+    return instance.settings.muted || (instance.settings.mutedByMaster && isMasterMuted);
+}
+
+function updateSynthMuteButton(instanceId, instance) {
+    const buttonElement = document.querySelector(`.mute-btn[data-instance-id="${instanceId}"]`);
+    if (buttonElement && instance) {
+        const shouldBeMuted = shouldSynthBeVisuallyMuted(instance);
+        buttonElement.innerHTML = shouldBeMuted ? svgIconMuted : svgIconUnmuted;
+    }
+}
+
+// Update all synth mute buttons based on current state
+function updateAllSynthMuteButtons() {
+    getAllRegularSynths().forEach(instance => {
+        updateSynthMuteButton(instance.id, instance);
+    });
+}
+
+// muteSynthVolume and unmuteSynthVolume functions moved to tone-synthesis.js
+
+// Make functions available globally for HTML onclick handlers
+window.startTransactionStream = startTransactionStream;
+window.stopTransactionStream = stopTransactionStream;
+// Add other functions that HTML buttons call
+
+// Load NFT preset data directly
+function loadNftPreset(presetData) {
+  try {
+    console.log('Loading NFT preset data:', presetData);
+
+    if (!presetData.activeSynths || !Array.isArray(presetData.activeSynths)) {
+      throw new Error('NFT preset is missing "activeSynths" array.');
+    }
+
+    console.log(`Loading NFT preset with ${presetData.activeSynths.length} synths`);
+    // Minted before stamping existed reads as legacy, permanently — the asset
+    // is on-chain and cannot be re-stamped.
+    readPresetProvenance(presetData, 'NFPreset');
+
+    // Clear Current State - more surgically
+    const regularSynths = activeSynths.filter(s => s.id !== 'master');
+    regularSynths.forEach(instance => {
+        // Handle UI-specific cleanup first
+        stopStateProofCountdown(instance.id);
+        // Then dispose synthesis objects
+        disposeSynth(instance.id, activeSynths);
+    });
+    activeSynths = activeSynths.filter(s => s.id === 'master');
+
+    const synthContainer = document.getElementById('synth-container');
+    const regularSynthElements = synthContainer.querySelectorAll('.mini-synth:not(.master-synth)');
+    regularSynthElements.forEach(el => el.remove());
+
+    // Process Loaded Data
+    let targetActiveSynths = presetData.activeSynths.map(loadedInstance => ({
+      ...loadedInstance,
+      settings: foldPitchIntoBaseNote({
+           ...getDefaultInstanceSettings(),
+           ...(loadedInstance.settings || {})
+      }),
+      toneObjects: null
+    }));
+
+    // Update State and Rebuild UI
+    activeSynths.push(...targetActiveSynths);
+
+    targetActiveSynths.forEach(instance => {
+      synthContainer.innerHTML += createSynthHTML(instance);
+      renderParameterArea(instance.id, instance.config.type, instance.config.subtype);
+    });
+
+    // Initialize Audio for New Instances
+    if (!synthsInitialized) {
+      initAudio().then(() => {
+        targetActiveSynths.forEach(instance => {
+          initializeToneForInstance(instance);
+        });
+      });
+    } else {
+      targetActiveSynths.forEach(instance => {
+        initializeToneForInstance(instance);
+      });
+    }
+
+    updateStatus(`NFT preset loaded successfully`);
+    setPresetUrl(pendingAssetIdForUrl); // null clears — non-linkable load
+    pendingAssetIdForUrl = null;
+    // Find the modal element directly
+    const loadModal = document.getElementById('load-preset-modal');
+    if (loadModal) {
+      loadModal.style.display = 'none';
+    }
+    hideLoadError();
+
+  } catch (error) {
+    console.error('Failed to load NFT preset:', error);
+    pendingAssetIdForUrl = null;
+    showLoadError(`Error loading NFT preset: ${error.message}`);
+  }
+}
+
+// Listen for messages from React
